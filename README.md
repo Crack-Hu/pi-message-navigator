@@ -103,6 +103,26 @@ pi -e ./message-navigator.ts
 pi install .
 ```
 
+## ctrl+t 的紧凑模式
+
+Pi 原生只有两个开关：
+
+| 开关 | 作用 |
+|---|---|
+| `ctrl+t` | 折叠 thinking（只作用于 #2） |
+| `ctrl+o` | 切换工具结果（#4）的预览/完整输出 |
+
+本扩展在 `ctrl+t` 隐藏 thinking 时，把整个工具块（#3 调用行 + #4 结果）一起隐藏：
+
+- 一段「thinking + 工具调用 + 工具结果」在视觉上只剩一行 `Thinking...`；
+- `ctrl+o` **不受影响**：非紧凑模式下仍然是原生的"预览 / 完整输出"切换；
+- 错误结果也会一起隐藏（模型通常会在正文里说明失败原因）；
+- `edit` 的 diff 预览也属于工具块，同样隐藏；
+- 工具运行中的调用行也会隐藏，所以紧凑模式下看不到执行进度。
+
+紧凑模式跟着 `hideThinkingBlock` 走，所以在 `~/.pi/agent/settings.json` 里设置
+`"hideThinkingBlock": true` 也会直接进入这个模式；`ctrl+t` 只是同一个开关的快捷键。
+
 ## 对 Pi 数据/上下文的影响
 
 只影响渲染层：

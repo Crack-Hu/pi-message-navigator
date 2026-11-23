@@ -22,11 +22,17 @@
  * replaces the built-in "Jump to latest" chip with one chip row above the
  * editor that holds "Prev", "Next" and "Latest" on a single line.
  *
+ * Hiding thinking blocks with ctrl+t also hides whole tool blocks (call row +
+ * result), leaving one "Thinking..." line per reasoning step. ctrl+o keeps its
+ * native preview / expand behavior outside compact mode.
+ *
  * Fullscreen only: in regular mode the terminal owns the scrollback.
  */
 
 import {
 	AssistantMessageComponent,
+	InteractiveMode,
+	ToolExecutionComponent,
 	UserMessageComponent,
 	type ExtensionAPI,
 	type Theme,
@@ -84,8 +90,22 @@ const altScreenProto = TuiAltScreen.prototype as unknown as {
 	compositeScrollToEndIndicator: CompositeIndicatorFn;
 };
 
+/** `updateThinkingBlockVisibility` is TS-private on InteractiveMode. */
+type UpdateThinkingVisibilityFn = (this: { hideThinkingBlock?: boolean }) => void;
+const interactiveProto = InteractiveMode.prototype as unknown as {
+	updateThinkingBlockVisibility: UpdateThinkingVisibilityFn;
+};
+
+/** Tool rendering hook used for the ctrl+t compact mode. */
+type ToolRenderFn = (this: unknown, width: number) => string[];
+const toolProto = ToolExecutionComponent.prototype as unknown as {
+	render: ToolRenderFn;
+};
+
 interface PatchState {
 	patched: boolean;
+	/** True while thinking blocks are hidden; tool call rows fold away. */
+	compactThinking: boolean;
 	/** Stable theme proxy from ctx.ui.theme; used to color the labels. */
 	theme?: Theme;
 	originals?: {
@@ -93,6 +113,8 @@ interface PatchState {
 		assistantRender: typeof AssistantMessageComponent.prototype.render;
 		scrollToPrompt: ScrollToPromptFn;
 		compositeIndicator: CompositeIndicatorFn;
+		updateThinkingVisibility: UpdateThinkingVisibilityFn;
+		toolRender: ToolRenderFn;
 	};
 }
 
@@ -102,7 +124,7 @@ function getState(): PatchState {
 	const holder = globalThis as unknown as Record<symbol, PatchState | undefined>;
 	let state = holder[STATE_KEY];
 	if (!state) {
-		state = { patched: false };
+		state = { patched: false, compactThinking: false };
 		holder[STATE_KEY] = state;
 	}
 	return state;
@@ -255,6 +277,7 @@ function installPatches(state: PatchState): void {
 
 	const assistantRender = AssistantMessageComponent.prototype.render;
 	AssistantMessageComponent.prototype.render = function (this: AssistantMessageComponent, width: number): string[] {
+		state.compactThinking = (this as unknown as { hideThinkingBlock?: boolean }).hideThinkingBlock === true;
 		const lines = assistantRender.call(this, width);
 		const offset = firstTextLineOffset(this as unknown as AssistantRuntime, width);
 		if (offset !== undefined) labelAssistantText(lines, offset, state);
@@ -277,7 +300,29 @@ function installPatches(state: PatchState): void {
 		return screen;
 	};
 
-	state.originals = { userRender, assistantRender, scrollToPrompt, compositeIndicator };
+	// ctrl+t toggles Pi's hideThinkingBlock; mirror it so tool blocks can hide.
+	const updateThinkingVisibility = interactiveProto.updateThinkingBlockVisibility;
+	interactiveProto.updateThinkingBlockVisibility = function (this: { hideThinkingBlock?: boolean }): void {
+		state.compactThinking = this.hideThinkingBlock === true;
+		updateThinkingVisibility.call(this);
+	};
+
+	// Compact mode hides whole tool components (call row + result) so only the
+	// "Thinking..." line remains. ctrl+o keeps its native behavior outside it.
+	const toolRender = toolProto.render;
+	toolProto.render = function (this: unknown, width: number): string[] {
+		if (state.compactThinking) return [];
+		return toolRender.call(this, width);
+	};
+
+	state.originals = {
+		userRender,
+		assistantRender,
+		scrollToPrompt,
+		compositeIndicator,
+		updateThinkingVisibility,
+		toolRender,
+	};
 	state.patched = true;
 }
 
@@ -288,8 +333,11 @@ function removePatches(state: PatchState): void {
 	AssistantMessageComponent.prototype.render = originals.assistantRender;
 	altScreenProto.scrollToPrompt = originals.scrollToPrompt;
 	altScreenProto.compositeScrollToEndIndicator = originals.compositeIndicator;
+	interactiveProto.updateThinkingBlockVisibility = originals.updateThinkingVisibility;
+	toolProto.render = originals.toolRender;
 	state.originals = undefined;
 	state.patched = false;
+	state.compactThinking = false;
 }
 
 // ---------------------------------------------------------------------------
