@@ -109,6 +109,10 @@ interface PatchState {
 	theme?: Theme;
 	/** Transient flash on the row an anchor jump landed on. */
 	focus?: { component: unknown; offset: number; visible: boolean };
+	/** Index of the anchor the last jump landed on, for Prev/Next chaining. */
+	anchorIndex?: number;
+	/** scrollTop right after that jump; a manual scroll invalidates the index. */
+	anchorScrollTop?: number;
 	focusTimer?: ReturnType<typeof setTimeout>;
 	originals?: {
 		userRender: typeof UserMessageComponent.prototype.render;
@@ -324,35 +328,52 @@ function landingRow(scrollView: TranscriptView["scrollView"], row: number): numb
 }
 
 function jumpToAnchor(tui: unknown, direction: -1 | 1): boolean {
+	const state = getState();
 	const transcript = findTranscript(tui);
 	if (!transcript) return false;
 	const anchors = collectAnchors(transcript);
 	if (anchors.length === 0) return false;
 	const top = transcript.scrollView.scrollTop;
-	let target: Anchor | undefined;
-	if (direction < 0) {
+	const stored = state.anchorIndex;
+	const storedValid =
+		stored !== undefined && stored >= 0 && stored < anchors.length && state.anchorScrollTop === top;
+
+	let targetIndex: number | undefined;
+	if (storedValid) {
+		// Chained navigation: use the anchor itself, not the viewport top. The
+		// landing offset puts the viewport above the current anchor, so looking
+		// only at rows < top would skip the message that was just reached.
+		targetIndex = direction < 0 ? stored - 1 : stored + 1;
+		if (targetIndex < 0 || targetIndex >= anchors.length) return false;
+	} else if (direction < 0) {
 		for (let i = anchors.length - 1; i >= 0; i--) {
 			const anchor = anchors[i];
 			if (anchor && anchor.row < top) {
-				target = anchor;
+				targetIndex = i;
 				break;
 			}
 		}
 	} else {
-		for (const anchor of anchors) {
-			if (anchor.row > top) {
-				target = anchor;
+		for (let i = 0; i < anchors.length; i++) {
+			const anchor = anchors[i];
+			if (anchor && anchor.row > top) {
+				targetIndex = i;
 				break;
 			}
 		}
 	}
+
+	if (targetIndex === undefined) return false;
+	const target = anchors[targetIndex];
 	if (!target) return false;
 	// Browsing: never re-enter follow mode just because the target is the last
 	// row. The chip row stays visible and new output does not yank the viewport.
 	transcript.scrollView.scrollTo(landingRow(transcript.scrollView, target.row), {
 		disableFollow: true,
 	});
-	startAnchorFlash(getState(), target);
+	state.anchorIndex = targetIndex;
+	state.anchorScrollTop = transcript.scrollView.scrollTop;
+	startAnchorFlash(state, target);
 	(tui as { requestRender?: () => void }).requestRender?.();
 	return true;
 }
@@ -529,6 +550,8 @@ function removePatches(state: PatchState): void {
 	state.compactThinking = false;
 	state.groups.clear();
 	clearAnchorFlash(state);
+	state.anchorIndex = undefined;
+	state.anchorScrollTop = undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +683,8 @@ export default function messageNavigatorExtension(pi: ExtensionAPI) {
 		state.groups.clear();
 		state.compactThinking = false;
 		clearAnchorFlash(state);
+		state.anchorIndex = undefined;
+		state.anchorScrollTop = undefined;
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		// Stable proxy: reflects later /theme changes automatically.
 		state.theme = ctx.ui.theme;
