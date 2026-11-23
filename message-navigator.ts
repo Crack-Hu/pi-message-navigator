@@ -22,9 +22,10 @@
  * replaces the built-in "Jump to latest" chip with one chip row above the
  * editor that holds "Prev", "Next" and "Latest" on a single line.
  *
- * Hiding thinking blocks with ctrl+t also hides whole tool blocks (call row +
- * result), leaving one "Thinking..." line per reasoning step. ctrl+o keeps its
- * native preview / expand behavior outside compact mode.
+ * Hiding thinking blocks with ctrl+t turns each thinking run plus its
+ * following tool calls into one collapsed block whose header previews the
+ * thinking text. Clicking the header expands the thinking and the tools;
+ * ctrl+o keeps its native preview / expand behavior for tool results.
  *
  * Fullscreen only: in regular mode the terminal owns the scrollback.
  */
@@ -96,16 +97,95 @@ const interactiveProto = InteractiveMode.prototype as unknown as {
 	updateThinkingBlockVisibility: UpdateThinkingVisibilityFn;
 };
 
-/** Tool rendering hook used for the ctrl+t compact mode. */
-type ToolRenderFn = (this: unknown, width: number) => string[];
+/** Tool rendering hook: group members hide while their thinking is collapsed. */
+interface ToolRuntime {
+	toolCallId?: string;
+}
+type ToolRenderFn = (this: ToolRuntime, width: number) => string[];
 const toolProto = ToolExecutionComponent.prototype as unknown as {
 	render: ToolRenderFn;
 };
 
+/** One thinking run plus the tool calls of the same assistant message. */
+interface ThinkingGroup {
+	assistant: AssistantRuntime;
+	runIndex: number;
+}
+
+/** Text of the first contiguous thinking run in an assistant message. */
+function firstThinkingRun(content: Array<{ type?: string; thinking?: string }>): string {
+	let text = "";
+	let started = false;
+	for (const block of content) {
+		if (block?.type === "thinking") {
+			started = true;
+			const value = typeof block.thinking === "string" ? block.thinking.trim() : "";
+			if (value) text += (text ? " " : "") + value;
+			continue;
+		}
+		if (started) break;
+	}
+	return text;
+}
+
+function isThinkingHidden(component: AssistantRuntime, runIndex: number): boolean {
+	const override = component.thinkingVisibilityOverrides?.get(runIndex);
+	return override ?? component.hideThinkingBlock === true;
+}
+
+/** One-line header: "▸ <first N columns of the thinking>…". */
+function buildThinkingPreview(component: AssistantRuntime, thinking: string, width: number, state: PatchState): string {
+	const plain = thinking.replace(/\s+/g, " ").trim();
+	const prefix = "▸ ";
+	const indent = " ".repeat(Math.max(0, component.outputPad ?? 0));
+	const available = Math.max(12, width - indent.length - prefix.length);
+	const preview = truncateToWidth(plain, available, "…");
+	const text = `${prefix}${preview}`;
+	const styled = state.theme ? state.theme.italic(state.theme.fg("thinkingText", text)) : text;
+	return indent + styled;
+}
+
+function replaceThinkingLabel(lines: string[], label: string, replacement: string): void {
+	const target = label.trim();
+	if (!target) return;
+	for (let i = 0; i < lines.length; i++) {
+		if (stripTerminalSequences(lines[i] ?? "").trim() === target) {
+			lines[i] = replacement;
+			return;
+		}
+	}
+}
+
+/**
+ * A thinking run and the tool calls that follow it are one group. While the
+ * thinking is hidden, the group's tool components disappear and the native
+ * "Thinking..." line becomes a truncated preview of the run. Clicking that
+ * line toggles the thinking run, which shows the tools again (their results
+ * still follow ctrl+o).
+ */
+function registerThinkingGroup(
+	state: PatchState,
+	component: AssistantRuntime,
+	content: Array<{ type?: string; thinking?: string; id?: string }>,
+	lines: string[],
+	width: number,
+): void {
+	const toolCalls = content.filter((block) => block?.type === "toolCall" && typeof block.id === "string");
+	if (toolCalls.length === 0) return;
+	const thinking = firstThinkingRun(content);
+	if (!thinking) return;
+	const runIndex = 0;
+	for (const call of toolCalls) state.groups.set(call.id as string, { assistant: component, runIndex });
+	if (!isThinkingHidden(component, runIndex)) return;
+	replaceThinkingLabel(lines, component.hiddenThinkingLabel ?? "", buildThinkingPreview(component, thinking, width, state));
+}
+
 interface PatchState {
 	patched: boolean;
-	/** True while thinking blocks are hidden; tool call rows fold away. */
+	/** True while thinking blocks are hidden; thinking+tool groups collapse. */
 	compactThinking: boolean;
+	/** toolCallId -> thinking group that owns it */
+	groups: Map<string, ThinkingGroup>;
 	/** Stable theme proxy from ctx.ui.theme; used to color the labels. */
 	theme?: Theme;
 	originals?: {
@@ -124,7 +204,7 @@ function getState(): PatchState {
 	const holder = globalThis as unknown as Record<symbol, PatchState | undefined>;
 	let state = holder[STATE_KEY];
 	if (!state) {
-		state = { patched: false, compactThinking: false };
+		state = { patched: false, compactThinking: false, groups: new Map() };
 		holder[STATE_KEY] = state;
 	}
 	return state;
@@ -230,6 +310,11 @@ interface MarkdownChild {
 interface AssistantRuntime {
 	markdownSlots?: Array<{ kind?: string; markdown?: MarkdownChild }>;
 	contentContainer?: { children?: MarkdownChild[] };
+	lastMessage?: { content?: Array<{ type?: string; text?: string; thinking?: string; id?: string }> };
+	hideThinkingBlock?: boolean;
+	thinkingVisibilityOverrides?: Map<number, boolean>;
+	hiddenThinkingLabel?: string;
+	outputPad?: number;
 }
 
 /**
@@ -277,9 +362,13 @@ function installPatches(state: PatchState): void {
 
 	const assistantRender = AssistantMessageComponent.prototype.render;
 	AssistantMessageComponent.prototype.render = function (this: AssistantMessageComponent, width: number): string[] {
-		state.compactThinking = (this as unknown as { hideThinkingBlock?: boolean }).hideThinkingBlock === true;
+		const runtime = this as unknown as AssistantRuntime;
+		state.compactThinking = runtime.hideThinkingBlock === true;
 		const lines = assistantRender.call(this, width);
-		const offset = firstTextLineOffset(this as unknown as AssistantRuntime, width);
+		if (state.compactThinking && runtime.lastMessage?.content) {
+			registerThinkingGroup(state, runtime, runtime.lastMessage.content, lines, width);
+		}
+		const offset = firstTextLineOffset(runtime, width);
 		if (offset !== undefined) labelAssistantText(lines, offset, state);
 		return lines;
 	};
@@ -300,18 +389,22 @@ function installPatches(state: PatchState): void {
 		return screen;
 	};
 
-	// ctrl+t toggles Pi's hideThinkingBlock; mirror it so tool blocks can hide.
+	// ctrl+t toggles Pi's hideThinkingBlock; mirror it so tool blocks can collapse.
 	const updateThinkingVisibility = interactiveProto.updateThinkingBlockVisibility;
 	interactiveProto.updateThinkingBlockVisibility = function (this: { hideThinkingBlock?: boolean }): void {
 		state.compactThinking = this.hideThinkingBlock === true;
 		updateThinkingVisibility.call(this);
 	};
 
-	// Compact mode hides whole tool components (call row + result) so only the
-	// "Thinking..." line remains. ctrl+o keeps its native behavior outside it.
+	// Group members vanish while their thinking run is collapsed. The group
+	// header is the native thinking label line, so clicking it expands both the
+	// thinking and the tools (results still follow ctrl+o once visible).
 	const toolRender = toolProto.render;
-	toolProto.render = function (this: unknown, width: number): string[] {
-		if (state.compactThinking) return [];
+	toolProto.render = function (this: ToolRuntime, width: number): string[] {
+		if (state.compactThinking && this.toolCallId) {
+			const group = state.groups.get(this.toolCallId);
+			if (group && isThinkingHidden(group.assistant, group.runIndex)) return [];
+		}
 		return toolRender.call(this, width);
 	};
 
@@ -338,6 +431,7 @@ function removePatches(state: PatchState): void {
 	state.originals = undefined;
 	state.patched = false;
 	state.compactThinking = false;
+	state.groups.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +561,8 @@ export default function previousMessageChipExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => removePatches(state));
 
 	pi.on("session_start", (_event, ctx) => {
+		state.groups.clear();
+		state.compactThinking = false;
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		// Stable proxy: reflects later /theme changes automatically.
 		state.theme = ctx.ui.theme;
