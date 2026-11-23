@@ -1,33 +1,24 @@
 /**
- * Previous-message navigation for Pi fullscreen mode.
+ * Message navigation for the Pi fullscreen transcript.
  *
- * Pi's transcript marks user prompts and *final* assistant messages with OSC 133
- * prompt markers. Assistant messages that call tools have no marker, so
- * `tui.altScreen.previousPrompt` lands at the end of the tool-call section
- * instead of at the start of the text the model actually wrote.
+ * Pi 1.6 keeps the rendered lines of every `Container` child, so user and
+ * assistant messages can be located by component identity and row offset
+ * directly. No labels, markers or other bytes are injected into the transcript.
  *
- * This extension renders visible label lines as scroll anchors:
+ * - `ctrl+up` / `↓ Prev`  jump to the previous message anchor
+ * - `ctrl+down` / `↓ Next` jump to the next message anchor
+ * - `ctrl+end` / `↓ Latest` jump to the bottom
  *
- *   ▌ user message:        before every user message
- *   ▌ assistant message:   before the first white text block of every
- *                          assistant message (thinking and tool output are
- *                          grey and get no label)
+ * An anchor is the first text row of a user message or the first white (text)
+ * block of an assistant message. Short targets land one third down the
+ * viewport; long targets and small viewports keep the anchor at the top.
  *
- * Each label is a colored header line preceded by one blank row. Labels are
- * display-only: no message, session entry, or model context is touched.
- *
- * The extension retargets Pi's own `previousPrompt` / `nextPrompt` transcript
- * scrolling to those labels, so ctrl+up / ctrl+down walk block by block
- * regardless of whether the block belongs to the user or the assistant, and
- * replaces the built-in "Jump to latest" chip with one chip row above the
- * editor that holds "Prev", "Next" and "Latest" on a single line.
- *
- * Hiding thinking blocks with ctrl+t turns each thinking run plus its
- * following tool calls into one collapsed block whose header previews the
- * thinking text. Clicking the header expands the thinking and the tools;
- * ctrl+o keeps its native preview / expand behavior for tool results.
- *
- * Fullscreen only: in regular mode the terminal owns the scrollback.
+ * Compact mode follows `hideThinkingBlock` (ctrl+t): a thinking run plus the
+ * tool calls of the same assistant message form one group. While the thinking
+ * is hidden the group collapses to a single preview line taken from the
+ * thinking text (truncated with an ellipsis), and the group's tool components
+ * disappear. Clicking the preview expands the full thinking and the tools;
+ * tool results keep ctrl+o's native preview / expand behavior.
  */
 
 import {
@@ -52,28 +43,7 @@ import {
 const WIDGET_KEY = "message-navigator";
 const WIDGET_PLACEMENT = "aboveEditor" as const;
 
-/** The marker Pi prepends to user messages and marker-enabled assistant messages. */
-const PROMPT_START = "\x1b]133;A\x07";
-/** Visible anchors rendered at block starts. Change the text here if you like. */
-const LABEL_PROMPT = "▌ user message:";
-const LABEL_REPLY = "▌ assistant message:";
-
-type LineMatcher = (line: string) => boolean;
-
-/**
- * The label text is wrapped in theme ANSI codes, so compare after stripping
- * terminal sequences. The cheap `includes` check rejects most lines first.
- */
-function startsWithLabel(line: string, label: string): boolean {
-	if (!line.includes(label)) return false;
-	return stripTerminalSequences(line).startsWith(label);
-}
-
-const isReplyStart: LineMatcher = (line) => startsWithLabel(line, LABEL_REPLY);
-const isPromptStart: LineMatcher = (line) => startsWithLabel(line, LABEL_PROMPT);
-const isBlockStart: LineMatcher = (line) => isReplyStart(line) || isPromptStart(line);
-
-/** When a block fits, its label lands this fraction down the viewport. */
+/** When a block fits, its anchor lands this fraction down the viewport. */
 const CONTEXT_FRACTION = 1 / 3;
 /** Below this many rows of breathing room, top-align instead (small windows/phones). */
 const MIN_CONTEXT_ROWS = 6;
@@ -82,9 +52,8 @@ const MIN_CONTEXT_ROWS = 6;
 // Shared state (survives /reload: the prototypes stay patched in-process)
 // ---------------------------------------------------------------------------
 
-/** `scrollToPrompt` is TS-private in pi-tui but a normal prototype method at runtime. */
+/** `scrollToPrompt` and `compositeScrollToEndIndicator` are TS-private in pi-tui. */
 type ScrollToPromptFn = (this: TuiAltScreen, direction: number) => void;
-/** `compositeScrollToEndIndicator` draws the built-in "Jump to latest" chip. */
 type CompositeIndicatorFn = (this: TuiAltScreen, screen: string[], layout: unknown, width: number) => string[];
 const altScreenProto = TuiAltScreen.prototype as unknown as {
 	scrollToPrompt: ScrollToPromptFn;
@@ -102,14 +71,57 @@ interface ToolRuntime {
 	toolCallId?: string;
 }
 type ToolRenderFn = (this: ToolRuntime, width: number) => string[];
-const toolProto = ToolExecutionComponent.prototype as unknown as {
-	render: ToolRenderFn;
-};
 
-/** One thinking run plus the tool calls of the same assistant message. */
 interface ThinkingGroup {
 	assistant: AssistantRuntime;
 	runIndex: number;
+}
+
+interface PatchState {
+	patched: boolean;
+	/** True while thinking blocks are hidden; thinking+tool groups collapse. */
+	compactThinking: boolean;
+	/** toolCallId -> thinking group that owns it. */
+	groups: Map<string, ThinkingGroup>;
+	/** Stable theme proxy from ctx.ui.theme; used for the preview line. */
+	theme?: Theme;
+	originals?: {
+		assistantRender: typeof AssistantMessageComponent.prototype.render;
+		scrollToPrompt: ScrollToPromptFn;
+		compositeIndicator: CompositeIndicatorFn;
+		updateThinkingVisibility: UpdateThinkingVisibilityFn;
+		toolRender: ToolRenderFn;
+	};
+}
+
+const STATE_KEY = Symbol.for("pi.message-navigator.state");
+
+function getState(): PatchState {
+	const holder = globalThis as unknown as Record<symbol, PatchState | undefined>;
+	let state = holder[STATE_KEY];
+	if (!state) {
+		state = { patched: false, compactThinking: false, groups: new Map() };
+		holder[STATE_KEY] = state;
+	}
+	return state;
+}
+
+// ---------------------------------------------------------------------------
+// Assistant runtime (duck-typed: fields are private in the component)
+// ---------------------------------------------------------------------------
+
+interface MarkdownChild {
+	render(width: number): string[];
+}
+
+interface AssistantRuntime {
+	markdownSlots?: Array<{ kind?: string; markdown?: MarkdownChild }>;
+	contentContainer?: { children?: MarkdownChild[] };
+	lastMessage?: { content?: Array<{ type?: string; text?: string; thinking?: string; id?: string }> };
+	hideThinkingBlock?: boolean;
+	thinkingVisibilityOverrides?: Map<number, boolean>;
+	hiddenThinkingLabel?: string;
+	outputPad?: number;
 }
 
 /** Text of the first contiguous thinking run in an assistant message. */
@@ -133,7 +145,7 @@ function isThinkingHidden(component: AssistantRuntime, runIndex: number): boolea
 	return override ?? component.hideThinkingBlock === true;
 }
 
-/** One-line header: "▸ <first N columns of the thinking>…". */
+/** One-line group header: "▸ <first N columns of the thinking>…". */
 function buildThinkingPreview(component: AssistantRuntime, thinking: string, width: number, state: PatchState): string {
 	const plain = thinking.replace(/\s+/g, " ").trim();
 	const prefix = "▸ ";
@@ -157,167 +169,6 @@ function replaceThinkingLabel(lines: string[], label: string, replacement: strin
 }
 
 /**
- * A thinking run and the tool calls that follow it are one group. While the
- * thinking is hidden, the group's tool components disappear and the native
- * "Thinking..." line becomes a truncated preview of the run. Clicking that
- * line toggles the thinking run, which shows the tools again (their results
- * still follow ctrl+o).
- */
-function registerThinkingGroup(
-	state: PatchState,
-	component: AssistantRuntime,
-	content: Array<{ type?: string; thinking?: string; id?: string }>,
-	lines: string[],
-	width: number,
-): void {
-	const toolCalls = content.filter((block) => block?.type === "toolCall" && typeof block.id === "string");
-	if (toolCalls.length === 0) return;
-	const thinking = firstThinkingRun(content);
-	if (!thinking) return;
-	const runIndex = 0;
-	for (const call of toolCalls) state.groups.set(call.id as string, { assistant: component, runIndex });
-	if (!isThinkingHidden(component, runIndex)) return;
-	replaceThinkingLabel(lines, component.hiddenThinkingLabel ?? "", buildThinkingPreview(component, thinking, width, state));
-}
-
-interface PatchState {
-	patched: boolean;
-	/** True while thinking blocks are hidden; thinking+tool groups collapse. */
-	compactThinking: boolean;
-	/** toolCallId -> thinking group that owns it */
-	groups: Map<string, ThinkingGroup>;
-	/** Stable theme proxy from ctx.ui.theme; used to color the labels. */
-	theme?: Theme;
-	originals?: {
-		userRender: typeof UserMessageComponent.prototype.render;
-		assistantRender: typeof AssistantMessageComponent.prototype.render;
-		scrollToPrompt: ScrollToPromptFn;
-		compositeIndicator: CompositeIndicatorFn;
-		updateThinkingVisibility: UpdateThinkingVisibilityFn;
-		toolRender: ToolRenderFn;
-	};
-}
-
-const STATE_KEY = Symbol.for("pi.message-navigator.state");
-
-function getState(): PatchState {
-	const holder = globalThis as unknown as Record<symbol, PatchState | undefined>;
-	let state = holder[STATE_KEY];
-	if (!state) {
-		state = { patched: false, compactThinking: false, groups: new Map() };
-		holder[STATE_KEY] = state;
-	}
-	return state;
-}
-
-// ---------------------------------------------------------------------------
-// Transcript access (duck-typed: TuiAltScreen keeps these private in TS)
-// ---------------------------------------------------------------------------
-
-interface TranscriptView {
-	scrollView: {
-		scrollTop: number;
-		scrollTo(row: number): void;
-		scrollToEnd?: () => void;
-		readonly viewportHeight?: number;
-	};
-	lines: string[];
-}
-
-function findTranscript(tui: unknown): TranscriptView | undefined {
-	const anyTui = tui as Record<string, any>;
-	const frame = anyTui.currentLayout;
-	if (!frame?.root) return undefined;
-	const scrollView = frame.primaryScrollView ?? anyTui.getPrimaryScrollView?.();
-	if (!scrollView) return undefined;
-	const stack: any[] = [frame.root];
-	while (stack.length > 0) {
-		const box = stack.pop();
-		if (!box) continue;
-		if (box.scrollView === scrollView && Array.isArray(box.scrollContentLines)) {
-			return { scrollView, lines: box.scrollContentLines };
-		}
-		if (Array.isArray(box.children)) stack.push(...box.children);
-	}
-	return undefined;
-}
-
-/**
- * Landing row for a jump. Short blocks get one third of the viewport of context
- * above them; long blocks and small viewports keep the label at the top.
- */
-function landingRow(scrollView: TranscriptView["scrollView"], lines: string[], row: number): number {
-	const viewportHeight = typeof scrollView.viewportHeight === "number" ? scrollView.viewportHeight : 0;
-	const contextRows = Math.floor(viewportHeight * CONTEXT_FRACTION);
-	if (contextRows < MIN_CONTEXT_ROWS) return row;
-	let next = row + 1;
-	while (next < lines.length && !isBlockStart(lines[next] ?? "")) next++;
-	const blockHeight = next - row;
-	if (blockHeight > viewportHeight - contextRows) return row;
-	return Math.max(0, row - contextRows);
-}
-
-/** Nearest matching row strictly above/below the current viewport top. */
-function jumpToMatchingRow(tui: unknown, direction: -1 | 1, matches: LineMatcher): boolean {
-	const transcript = findTranscript(tui);
-	if (!transcript) return false;
-	const { scrollView, lines } = transcript;
-	for (let row = scrollView.scrollTop + direction; row >= 0 && row < lines.length; row += direction) {
-		if (matches(lines[row] ?? "")) {
-			scrollView.scrollTo(landingRow(scrollView, lines, row));
-			(tui as { requestRender?: () => void }).requestRender?.();
-			return true;
-		}
-	}
-	return false;
-}
-
-// ---------------------------------------------------------------------------
-// Visible labels
-// ---------------------------------------------------------------------------
-
-function isBlankLine(line: string): boolean {
-	return stripTerminalSequences(line).trim().length === 0;
-}
-
-/** Colored header styling; falls back to plain text before the theme is known. */
-function styledLabel(state: PatchState, label: string): string {
-	const theme = state.theme;
-	if (!theme) return label;
-	try {
-		return theme.bold(theme.fg("accent", label));
-	} catch {
-		return label;
-	}
-}
-
-/**
- * Put the prompt label above the message block with one plain blank row below
- * it. The message's own bg padding row stays where it was.
- */
-function labelUserMessage(lines: string[], state: PatchState): void {
-	if (lines.length === 0) return;
-	const first = lines[0] ?? "";
-	// Never touch inline image protocol lines.
-	if (first.includes("\x1b_G") || first.includes("\x1b]1337;File=")) return;
-	lines.unshift(PROMPT_START + styledLabel(state, LABEL_PROMPT), "");
-}
-
-interface MarkdownChild {
-	render(width: number): string[];
-}
-
-interface AssistantRuntime {
-	markdownSlots?: Array<{ kind?: string; markdown?: MarkdownChild }>;
-	contentContainer?: { children?: MarkdownChild[] };
-	lastMessage?: { content?: Array<{ type?: string; text?: string; thinking?: string; id?: string }> };
-	hideThinkingBlock?: boolean;
-	thinkingVisibilityOverrides?: Map<number, boolean>;
-	hiddenThinkingLabel?: string;
-	outputPad?: number;
-}
-
-/**
  * Rendered line offset of the first assistant *text* block (white text).
  * Thinking blocks and the hidden-thinking label have kind "thinking" or are
  * plain Text children, so they are skipped.
@@ -337,50 +188,167 @@ function firstTextLineOffset(component: AssistantRuntime, width: number): number
 }
 
 /**
- * Insert the reply label right before the text block with one blank row above
- * and one below, so the header stands alone between thinking/tool output and
- * the text.
+ * A thinking run and the tool calls that follow it are one group. While the
+ * thinking is hidden, the group's tool components disappear and the native
+ * "Thinking..." line becomes a truncated preview of the run. Clicking that
+ * line toggles the thinking run, which shows the tools again.
  */
-function labelAssistantText(lines: string[], offset: number, state: PatchState): void {
-	if (offset < 0 || offset > lines.length) return;
-	const at = lines[offset] ?? "";
-	if (at.includes("\x1b_G") || at.includes("\x1b]1337;File=")) return;
-	const label = PROMPT_START + styledLabel(state, LABEL_REPLY);
-	const hasBlankBefore = offset > 0 && isBlankLine(lines[offset - 1] ?? "");
-	lines.splice(offset, 0, ...(hasBlankBefore ? [label, ""] : ["", label, ""]));
+function registerThinkingGroup(
+	state: PatchState,
+	component: AssistantRuntime,
+	content: Array<{ type?: string; thinking?: string; id?: string }>,
+	lines: string[],
+	width: number,
+): void {
+	const toolCalls = content.filter((block) => block?.type === "toolCall" && typeof block.id === "string");
+	if (toolCalls.length === 0) return;
+	const thinking = firstThinkingRun(content);
+	if (!thinking) return;
+	const runIndex = 0;
+	for (const call of toolCalls) state.groups.set(call.id as string, { assistant: component, runIndex });
+	if (!isThinkingHidden(component, runIndex)) return;
+	replaceThinkingLabel(lines, component.hiddenThinkingLabel ?? "", buildThinkingPreview(component, thinking, width, state));
 }
+
+// ---------------------------------------------------------------------------
+// Transcript access
+// ---------------------------------------------------------------------------
+
+interface ChildLines {
+	width?: number;
+	children?: readonly unknown[];
+	parts?: readonly string[][];
+}
+
+interface TranscriptView {
+	scrollView: {
+		scrollTop: number;
+		scrollTo(row: number): void;
+		scrollToEnd?: () => void;
+		readonly viewportHeight?: number;
+	};
+	lines: string[];
+	document?: { childLines?: ChildLines };
+}
+
+function findTranscript(tui: unknown): TranscriptView | undefined {
+	const anyTui = tui as Record<string, any>;
+	const frame = anyTui.currentLayout;
+	if (!frame?.root) return undefined;
+	const scrollView = frame.primaryScrollView ?? anyTui.getPrimaryScrollView?.();
+	if (!scrollView) return undefined;
+	const stack: any[] = [frame.root];
+	while (stack.length > 0) {
+		const box = stack.pop();
+		if (!box) continue;
+		if (box.scrollView === scrollView && Array.isArray(box.scrollContentLines)) {
+			const document = (box.children?.[0]?.component ?? scrollView.child) as TranscriptView["document"];
+			return { scrollView, lines: box.scrollContentLines, document };
+		}
+		if (Array.isArray(box.children)) stack.push(...box.children);
+	}
+	return undefined;
+}
+
+/**
+ * Rendered rows of every user message (first text row) and assistant message
+ * (first white text row), in document order.
+ *
+ * `Container.childLines` keeps the rendered lines of each direct child, so the
+ * offsets are exact without injecting anything into the transcript.
+ */
+function collectAnchors(transcript: TranscriptView): number[] {
+	const anchors: number[] = [];
+	const visit = (container: unknown, baseRow: number): void => {
+		const layout = (container as { childLines?: ChildLines } | undefined)?.childLines;
+		if (!layout?.children || !Array.isArray(layout.parts)) return;
+		const width = typeof layout.width === "number" ? layout.width : 0;
+		let row = baseRow;
+		for (let i = 0; i < layout.children.length; i++) {
+			const child = layout.children[i];
+			const height = layout.parts[i]?.length ?? 0;
+			if (child instanceof UserMessageComponent) {
+				// The message starts with one row of Markdown top padding.
+				anchors.push(row + 1);
+			} else if (child instanceof AssistantMessageComponent) {
+				const offset = firstTextLineOffset(child as unknown as AssistantRuntime, width);
+				if (offset !== undefined) anchors.push(row + offset);
+			} else if ((child as { childLines?: ChildLines })?.childLines) {
+				visit(child, row);
+			}
+			row += height;
+		}
+	};
+	if (transcript.document) visit(transcript.document, 0);
+	return anchors;
+}
+
+/**
+ * Landing row for a jump. Short blocks get one third of the viewport of
+ * context above them; long blocks and small viewports keep the anchor on top.
+ */
+function landingRow(scrollView: TranscriptView["scrollView"], lines: string[], anchors: number[], row: number): number {
+	const viewportHeight = typeof scrollView.viewportHeight === "number" ? scrollView.viewportHeight : 0;
+	const contextRows = Math.floor(viewportHeight * CONTEXT_FRACTION);
+	if (contextRows < MIN_CONTEXT_ROWS) return row;
+	const next = anchors.find((anchor) => anchor > row) ?? lines.length;
+	const blockHeight = next - row;
+	if (blockHeight > viewportHeight - contextRows) return row;
+	return Math.max(0, row - contextRows);
+}
+
+function jumpToAnchor(tui: unknown, direction: -1 | 1): boolean {
+	const transcript = findTranscript(tui);
+	if (!transcript) return false;
+	const anchors = collectAnchors(transcript);
+	if (anchors.length === 0) return false;
+	const top = transcript.scrollView.scrollTop;
+	let row: number | undefined;
+	if (direction < 0) {
+		for (let i = anchors.length - 1; i >= 0; i--) {
+			if ((anchors[i] ?? 0) < top) {
+				row = anchors[i];
+				break;
+			}
+		}
+	} else {
+		for (const anchor of anchors) {
+			if (anchor > top) {
+				row = anchor;
+				break;
+			}
+		}
+	}
+	if (row === undefined) return false;
+	transcript.scrollView.scrollTo(landingRow(transcript.scrollView, transcript.lines, anchors, row));
+	(tui as { requestRender?: () => void }).requestRender?.();
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Patches
+// ---------------------------------------------------------------------------
 
 function installPatches(state: PatchState): void {
 	if (state.patched) return;
-
-	const userRender = UserMessageComponent.prototype.render;
-	UserMessageComponent.prototype.render = function (this: UserMessageComponent, width: number): string[] {
-		// Container.render reuses its lines array across frames; copy before
-		// inserting rows so labels do not accumulate every frame.
-		const lines = [...userRender.call(this, width)];
-		labelUserMessage(lines, state);
-		return lines;
-	};
 
 	const assistantRender = AssistantMessageComponent.prototype.render;
 	AssistantMessageComponent.prototype.render = function (this: AssistantMessageComponent, width: number): string[] {
 		const runtime = this as unknown as AssistantRuntime;
 		state.compactThinking = runtime.hideThinkingBlock === true;
-		// Copy: the original may return a cached array shared across frames.
-		const lines = [...assistantRender.call(this, width)];
-		if (state.compactThinking && runtime.lastMessage?.content) {
-			registerThinkingGroup(state, runtime, runtime.lastMessage.content, lines, width);
-		}
-		const offset = firstTextLineOffset(runtime, width);
-		if (offset !== undefined) labelAssistantText(lines, offset, state);
+		const original = assistantRender.call(this, width);
+		if (!state.compactThinking || !runtime.lastMessage?.content) return original;
+		// Container.render reuses its array across frames; copy before replacing
+		// the thinking label with the group preview.
+		const lines = [...original];
+		registerThinkingGroup(state, runtime, runtime.lastMessage.content, lines, width);
 		return lines;
 	};
 
-	// Retarget Pi's own prompt jumping at the visible labels instead of the OSC
-	// markers that only exist on the last assistant message of a turn.
+	// Retarget Pi's prompt jumping at message anchors instead of OSC markers.
 	const scrollToPrompt = altScreenProto.scrollToPrompt;
 	altScreenProto.scrollToPrompt = function (this: TuiAltScreen, direction: number): void {
-		if ((direction === -1 || direction === 1) && jumpToMatchingRow(this, direction, isBlockStart)) return;
+		if ((direction === -1 || direction === 1) && jumpToAnchor(this, direction)) return;
 		scrollToPrompt.call(this, direction);
 	};
 
@@ -392,7 +360,7 @@ function installPatches(state: PatchState): void {
 		return screen;
 	};
 
-	// ctrl+t toggles Pi's hideThinkingBlock; mirror it so tool blocks can collapse.
+	// ctrl+t toggles Pi's hideThinkingBlock; mirror it so groups can collapse.
 	const updateThinkingVisibility = interactiveProto.updateThinkingBlockVisibility;
 	interactiveProto.updateThinkingBlockVisibility = function (this: { hideThinkingBlock?: boolean }): void {
 		state.compactThinking = this.hideThinkingBlock === true;
@@ -402,7 +370,8 @@ function installPatches(state: PatchState): void {
 	// Group members vanish while their thinking run is collapsed. The group
 	// header is the native thinking label line, so clicking it expands both the
 	// thinking and the tools (results still follow ctrl+o once visible).
-	const toolRender = toolProto.render;
+	const toolRender = ToolExecutionComponent.prototype.render as ToolRenderFn;
+	const toolProto = ToolExecutionComponent.prototype as unknown as { render: ToolRenderFn };
 	toolProto.render = function (this: ToolRuntime, width: number): string[] {
 		if (state.compactThinking && this.toolCallId) {
 			const group = state.groups.get(this.toolCallId);
@@ -412,7 +381,6 @@ function installPatches(state: PatchState): void {
 	};
 
 	state.originals = {
-		userRender,
 		assistantRender,
 		scrollToPrompt,
 		compositeIndicator,
@@ -425,12 +393,11 @@ function installPatches(state: PatchState): void {
 function removePatches(state: PatchState): void {
 	const originals = state.originals;
 	if (!state.patched || !originals) return;
-	UserMessageComponent.prototype.render = originals.userRender;
 	AssistantMessageComponent.prototype.render = originals.assistantRender;
 	altScreenProto.scrollToPrompt = originals.scrollToPrompt;
 	altScreenProto.compositeScrollToEndIndicator = originals.compositeIndicator;
 	interactiveProto.updateThinkingBlockVisibility = originals.updateThinkingVisibility;
-	toolProto.render = originals.toolRender;
+	(ToolExecutionComponent.prototype as unknown as { render: ToolRenderFn }).render = originals.toolRender;
 	state.originals = undefined;
 	state.patched = false;
 	state.compactThinking = false;
@@ -441,7 +408,6 @@ function removePatches(state: PatchState): void {
 // Chip row
 // ---------------------------------------------------------------------------
 
-/** Shortcut hint: prefer the plain binding, else the last configured one. */
 function shortcutFor(keybinding: "tui.altScreen.previousPrompt" | "tui.altScreen.nextPrompt" | "tui.altScreen.bottom"): string[] {
 	try {
 		return getKeybindings().getKeys(keybinding);
@@ -482,11 +448,11 @@ class NavigationChips implements Component {
 		const buttons = [
 			{
 				label: ` ↑ Prev${this.keyHint("tui.altScreen.previousPrompt", "ctrl+up")} `,
-				action: () => jumpToMatchingRow(this.tui, -1, isBlockStart),
+				action: () => jumpToAnchor(this.tui, -1),
 			},
 			{
 				label: ` ↓ Next${this.keyHint("tui.altScreen.nextPrompt", "ctrl+down")} `,
-				action: () => jumpToMatchingRow(this.tui, 1, isBlockStart),
+				action: () => jumpToAnchor(this.tui, 1),
 			},
 			{
 				label: ` ↓ Latest${this.keyHint("tui.altScreen.bottom", "ctrl+end")} `,
@@ -555,7 +521,7 @@ class NavigationChips implements Component {
 // Extension
 // ---------------------------------------------------------------------------
 
-export default function previousMessageChipExtension(pi: ExtensionAPI) {
+export default function messageNavigatorExtension(pi: ExtensionAPI) {
 	const state = getState();
 	installPatches(state);
 
@@ -569,10 +535,6 @@ export default function previousMessageChipExtension(pi: ExtensionAPI) {
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		// Stable proxy: reflects later /theme changes automatically.
 		state.theme = ctx.ui.theme;
-		ctx.ui.setWidget(
-			WIDGET_KEY,
-			(tui, theme) => new NavigationChips(tui, theme),
-			{ placement: WIDGET_PLACEMENT },
-		);
+		ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => new NavigationChips(tui, theme), { placement: WIDGET_PLACEMENT });
 	});
 }
