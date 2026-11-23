@@ -1,0 +1,21 @@
+{
+  "name": "pi-message-navigator",
+  "version": "0.3.0",
+  "description": "Visible message labels and prev/next navigation for the Pi fullscreen transcript",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "transcript",
+    "navigation",
+    "fullscreen"
+  ],
+  "pi": {
+    "extensions": [
+      "./message-navigator.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
