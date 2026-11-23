@@ -19,7 +19,8 @@
  * The extension retargets Pi's own `previousPrompt` / `nextPrompt` transcript
  * scrolling to those labels, so ctrl+up / ctrl+down walk block by block
  * regardless of whether the block belongs to the user or the assistant, and
- * adds two clickable chips above the editor ("Prev" and "Next").
+ * replaces the built-in "Jump to latest" chip with one chip row above the
+ * editor that holds "Prev", "Next" and "Latest" on a single line.
  *
  * Fullscreen only: in regular mode the terminal owns the scrollback.
  */
@@ -65,13 +66,23 @@ const isReplyStart: LineMatcher = (line) => startsWithLabel(line, LABEL_REPLY);
 const isPromptStart: LineMatcher = (line) => startsWithLabel(line, LABEL_PROMPT);
 const isBlockStart: LineMatcher = (line) => isReplyStart(line) || isPromptStart(line);
 
+/** When a block fits, its label lands this fraction down the viewport. */
+const CONTEXT_FRACTION = 1 / 3;
+/** Below this many rows of breathing room, top-align instead (small windows/phones). */
+const MIN_CONTEXT_ROWS = 6;
+
 // ---------------------------------------------------------------------------
 // Shared state (survives /reload: the prototypes stay patched in-process)
 // ---------------------------------------------------------------------------
 
 /** `scrollToPrompt` is TS-private in pi-tui but a normal prototype method at runtime. */
 type ScrollToPromptFn = (this: TuiAltScreen, direction: number) => void;
-const altScreenProto = TuiAltScreen.prototype as unknown as { scrollToPrompt: ScrollToPromptFn };
+/** `compositeScrollToEndIndicator` draws the built-in "Jump to latest" chip. */
+type CompositeIndicatorFn = (this: TuiAltScreen, screen: string[], layout: unknown, width: number) => string[];
+const altScreenProto = TuiAltScreen.prototype as unknown as {
+	scrollToPrompt: ScrollToPromptFn;
+	compositeScrollToEndIndicator: CompositeIndicatorFn;
+};
 
 interface PatchState {
 	patched: boolean;
@@ -81,6 +92,7 @@ interface PatchState {
 		userRender: typeof UserMessageComponent.prototype.render;
 		assistantRender: typeof AssistantMessageComponent.prototype.render;
 		scrollToPrompt: ScrollToPromptFn;
+		compositeIndicator: CompositeIndicatorFn;
 	};
 }
 
@@ -101,7 +113,12 @@ function getState(): PatchState {
 // ---------------------------------------------------------------------------
 
 interface TranscriptView {
-	scrollView: { scrollTop: number; scrollTo(row: number): void };
+	scrollView: {
+		scrollTop: number;
+		scrollTo(row: number): void;
+		scrollToEnd?: () => void;
+		readonly viewportHeight?: number;
+	};
 	lines: string[];
 }
 
@@ -123,6 +140,21 @@ function findTranscript(tui: unknown): TranscriptView | undefined {
 	return undefined;
 }
 
+/**
+ * Landing row for a jump. Short blocks get one third of the viewport of context
+ * above them; long blocks and small viewports keep the label at the top.
+ */
+function landingRow(scrollView: TranscriptView["scrollView"], lines: string[], row: number): number {
+	const viewportHeight = typeof scrollView.viewportHeight === "number" ? scrollView.viewportHeight : 0;
+	const contextRows = Math.floor(viewportHeight * CONTEXT_FRACTION);
+	if (contextRows < MIN_CONTEXT_ROWS) return row;
+	let next = row + 1;
+	while (next < lines.length && !isBlockStart(lines[next] ?? "")) next++;
+	const blockHeight = next - row;
+	if (blockHeight > viewportHeight - contextRows) return row;
+	return Math.max(0, row - contextRows);
+}
+
 /** Nearest matching row strictly above/below the current viewport top. */
 function jumpToMatchingRow(tui: unknown, direction: -1 | 1, matches: LineMatcher): boolean {
 	const transcript = findTranscript(tui);
@@ -130,7 +162,7 @@ function jumpToMatchingRow(tui: unknown, direction: -1 | 1, matches: LineMatcher
 	const { scrollView, lines } = transcript;
 	for (let row = scrollView.scrollTop + direction; row >= 0 && row < lines.length; row += direction) {
 		if (matches(lines[row] ?? "")) {
-			scrollView.scrollTo(row);
+			scrollView.scrollTo(landingRow(scrollView, lines, row));
 			(tui as { requestRender?: () => void }).requestRender?.();
 			return true;
 		}
@@ -158,20 +190,15 @@ function styledLabel(state: PatchState, label: string): string {
 }
 
 /**
- * Put the prompt label above the message's top padding row. The padding row
- * stays in place and serves as the blank line below the label.
+ * Put the prompt label above the message block with one plain blank row below
+ * it. The message's own bg padding row stays where it was.
  */
 function labelUserMessage(lines: string[], state: PatchState): void {
 	if (lines.length === 0) return;
 	const first = lines[0] ?? "";
 	// Never touch inline image protocol lines.
 	if (first.includes("\x1b_G") || first.includes("\x1b]1337;File=")) return;
-	const label = PROMPT_START + styledLabel(state, LABEL_PROMPT);
-	if (isBlankLine(first)) {
-		lines.unshift(label);
-		return;
-	}
-	lines.unshift(label, "");
+	lines.unshift(PROMPT_START + styledLabel(state, LABEL_PROMPT), "");
 }
 
 interface MarkdownChild {
@@ -242,7 +269,15 @@ function installPatches(state: PatchState): void {
 		scrollToPrompt.call(this, direction);
 	};
 
-	state.originals = { userRender, assistantRender, scrollToPrompt };
+	// Hide the built-in "↓ Jump to latest message" chip; the chip row renders
+	// its own "Latest" button on the same line as Prev/Next.
+	const compositeIndicator = altScreenProto.compositeScrollToEndIndicator;
+	altScreenProto.compositeScrollToEndIndicator = function (this: TuiAltScreen, screen: string[]): string[] {
+		(this as unknown as { scrollToEndIndicatorRect?: unknown }).scrollToEndIndicatorRect = undefined;
+		return screen;
+	};
+
+	state.originals = { userRender, assistantRender, scrollToPrompt, compositeIndicator };
 	state.patched = true;
 }
 
@@ -252,6 +287,7 @@ function removePatches(state: PatchState): void {
 	UserMessageComponent.prototype.render = originals.userRender;
 	AssistantMessageComponent.prototype.render = originals.assistantRender;
 	altScreenProto.scrollToPrompt = originals.scrollToPrompt;
+	altScreenProto.compositeScrollToEndIndicator = originals.compositeIndicator;
 	state.originals = undefined;
 	state.patched = false;
 }
@@ -261,23 +297,24 @@ function removePatches(state: PatchState): void {
 // ---------------------------------------------------------------------------
 
 /** Shortcut hint: prefer the plain binding, else the last configured one. */
-function shortcutFor(keybinding: "tui.altScreen.previousPrompt" | "tui.altScreen.nextPrompt", preferred: string): string {
+function shortcutFor(keybinding: "tui.altScreen.previousPrompt" | "tui.altScreen.nextPrompt" | "tui.altScreen.bottom"): string[] {
 	try {
-		const keys = getKeybindings().getKeys(keybinding);
-		if (keys.length === 0) return "";
-		return keys.find((key) => key === preferred) ?? keys[keys.length - 1] ?? "";
+		return getKeybindings().getKeys(keybinding);
 	} catch {
-		return "";
+		return [];
 	}
+}
+
+interface ChipHit {
+	start: number;
+	end: number;
+	action: () => void;
 }
 
 class NavigationChips implements Component {
 	private cachedWidth: number | undefined;
 	private cachedLine: string | undefined;
-	private prevStart = 0;
-	private prevEnd = 0;
-	private nextStart = 0;
-	private nextEnd = 0;
+	private hits: ChipHit[] = [];
 
 	constructor(
 		private readonly tui: unknown,
@@ -291,60 +328,73 @@ class NavigationChips implements Component {
 
 	render(width: number): string[] {
 		if (!this.shouldShow()) {
-			this.resetHits();
+			this.hits = [];
 			this.cachedLine = undefined;
 			return [];
 		}
 		if (this.cachedLine !== undefined && this.cachedWidth === width) return [this.cachedLine];
 
-		const prevKey = shortcutFor("tui.altScreen.previousPrompt", "ctrl+up");
-		const nextKey = shortcutFor("tui.altScreen.nextPrompt", "ctrl+down");
-		const prevLabel = ` ↑ Prev${prevKey ? ` · ${prevKey}` : ""} `;
-		const nextLabel = ` ↓ Next${nextKey ? ` · ${nextKey}` : ""} `;
-		const gap = "   ";
-		const total = visibleWidth(prevLabel) + gap.length + visibleWidth(nextLabel);
-		const start = Math.max(0, Math.floor((width - total) / 2));
+		const buttons = [
+			{
+				label: ` ↑ Prev${this.keyHint("tui.altScreen.previousPrompt", "ctrl+up")} `,
+				action: () => jumpToMatchingRow(this.tui, -1, isBlockStart),
+			},
+			{
+				label: ` ↓ Next${this.keyHint("tui.altScreen.nextPrompt", "ctrl+down")} `,
+				action: () => jumpToMatchingRow(this.tui, 1, isBlockStart),
+			},
+			{
+				label: ` ↓ Latest${this.keyHint("tui.altScreen.bottom", "ctrl+end")} `,
+				action: () => this.jumpToLatest(),
+			},
+		];
 
-		const prevAt = start;
-		const nextAt = start + visibleWidth(prevLabel) + gap.length;
-		const line = truncateToWidth(
-			" ".repeat(start) +
-				this.theme.bg("selectedBg", this.theme.fg("text", prevLabel)) +
-				gap +
-				this.theme.bg("selectedBg", this.theme.fg("text", nextLabel)),
-			width,
-			"",
-		);
+		const gap = "   ";
+		const widths = buttons.map((button) => visibleWidth(button.label));
+		const total = widths.reduce((sum, w) => sum + w, gap.length * (buttons.length - 1));
+		const start = Math.max(Math.floor((width - total) / 2), 0);
+
+		const parts: string[] = [];
+		const hits: ChipHit[] = [];
+		let x = start;
+		buttons.forEach((button, index) => {
+			if (index > 0) x += gap.length;
+			hits.push({ start: x, end: x + (widths[index] ?? 0), action: button.action });
+			parts.push(this.theme.bg("selectedBg", this.theme.fg("text", button.label)));
+			x += widths[index] ?? 0;
+		});
 
 		this.cachedWidth = width;
-		this.cachedLine = line;
-		this.prevStart = prevAt;
-		this.prevEnd = Math.min(width, prevAt + visibleWidth(prevLabel));
-		this.nextStart = nextAt;
-		this.nextEnd = Math.min(width, nextAt + visibleWidth(nextLabel));
-		return [line];
+		this.cachedLine = truncateToWidth(" ".repeat(start) + parts.join(gap), width, "");
+		this.hits = hits;
+		return [this.cachedLine];
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (event.type !== "click" || event.button !== "left") return undefined;
 		if (this.cachedLine === undefined) return undefined;
-		const hit = (from: number, to: number) => event.x >= from && event.x < to;
-		if (hit(this.prevStart, this.prevEnd)) {
-			jumpToMatchingRow(this.tui, -1, isBlockStart);
-			return { handled: true };
-		}
-		if (hit(this.nextStart, this.nextEnd)) {
-			jumpToMatchingRow(this.tui, 1, isBlockStart);
-			return { handled: true };
-		}
-		return undefined;
+		const hit = this.hits.find(({ start, end }) => event.x >= start && event.x < end);
+		if (!hit) return undefined;
+		hit.action();
+		return { handled: true };
 	}
 
-	private resetHits(): void {
-		this.prevStart = 0;
-		this.prevEnd = 0;
-		this.nextStart = 0;
-		this.nextEnd = 0;
+	private keyHint(keybinding: "tui.altScreen.previousPrompt" | "tui.altScreen.nextPrompt" | "tui.altScreen.bottom", preferred: string): string {
+		const keys = shortcutFor(keybinding);
+		if (keys.length === 0) return "";
+		const key = keys.includes(preferred) ? preferred : (keys[keys.length - 1] ?? "");
+		return key ? ` · ${key}` : "";
+	}
+
+	private jumpToLatest(): void {
+		const anyTui = this.tui as { scrollToBottom?: () => void; requestRender?: () => void };
+		if (typeof anyTui.scrollToBottom === "function") {
+			anyTui.scrollToBottom();
+			return;
+		}
+		const transcript = findTranscript(this.tui);
+		transcript?.scrollView.scrollToEnd?.();
+		anyTui.requestRender?.();
 	}
 
 	/** Hidden while the transcript follows new output. */

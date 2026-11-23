@@ -15,16 +15,26 @@
 
    （模型真正对你说的话，白色正文）
 
-   ↑ Prev · ctrl+up     ↓ Next · ctrl+down    ← 向上滚动时出现的两个胶囊
-> 输入框
+   ↑ Prev · ctrl+up     ↓ Next · ctrl+down     ↓ Latest · ctrl+end
+> 输入框                                       ← 三个按钮同一行，向上滚动时出现
 ```
 
 | 操作 | 落点 |
 |---|---|
 | `ctrl+up` 或点 `↑ Prev` | 上一条标签（用户消息或 assistant 白色正文，不区分） |
 | `ctrl+down` 或点 `↓ Next` | 下一条标签 |
+| `ctrl+end` 或点 `↓ Latest` | 跳到底部并恢复跟随 |
+
+### 落点高度
+
+- 块（从标签到下一条标签）高度能放进视口下方 2/3 时，标签落在**视口 1/3**处，上方留出上一段内容作为呼吸空间；
+- 块太长放不下时**顶格**（标签在视口顶部）；
+- 视口本身很小时（1/3 不足 6 行，手机/小窗口）也**顶格**。
+
+常量在文件顶部：`CONTEXT_FRACTION = 1 / 3`、`MIN_CONTEXT_ROWS = 6`。
 
 标签统一处理：不管上一条是用户消息还是 assistant 正文，向上/向下都只按"上一个/下一个块"移动。
+三个按钮在同一行；内置的 "↓ Jump to latest message" 胶囊被隐藏并由这一行的 `Latest` 取代。
 
 标签就是跳转锚点：能看见、能被搜索、能被复制，没有隐藏字符（唯一的不可见序列是 Pi 自己就在写的 `OSC 133;A`）。
 
@@ -32,14 +42,14 @@
 
 ## 标签放在哪里
 
-- **user**：在 `UserMessageComponent.render` 里把 `▌ user message:` 插到消息顶部 padding 行之前（padding 行保留，作为标签下方的空行）；
+- **user**：在 `UserMessageComponent.render` 里把 `▌ user message:` + 一条空行插到消息顶部 padding 行之前（padding 行本身也还在）；
 - **assistant**：在 `AssistantMessageComponent.render` 里找到第一个 **`kind === "text"` 的 Markdown 块**（白色正文），在它前面插入 `▌ assistant message:`。
 
 关键点：
 
 - thinking 块（`kind === "thinking"`，灰色/斜体）和隐藏 thinking 的 `Text` 行都不会被标记；
 - 只带 thinking + tool call、没有正文的 assistant 消息不会出现标签；
-- 标签上下**各一条空行**；user 标签让 transcript 多一行，assistant 标签多两行；
+- 标签上下**各一条空行**；user 标签让 transcript 多两行（plain 空行 + 原有 padding），assistant 标签多两行；
 - 标签用 `theme.fg("accent", ...) + bold` 着色（主题切换会自动跟随）；
 - 用户消息的标签行保留 Pi 的 `OSC 133;A` 标记。
 
@@ -62,7 +72,7 @@ Pi 核心只在这两类消息上写 OSC 133 标记：
 - 内置 keybinding 已存在：`tui.altScreen.previousPrompt` / `nextPrompt`（默认 `ctrl+shift+up`、`ctrl+up`）。
 - 内置的 "↓ Jump to latest message" 由 Pi 在 `dist/modes/interactive/tui-renderer.js` 里通过
   `scrollToEndIndicator` 传给 renderer，由 `compositeScrollToEndIndicator()` 直接叠加在 transcript
-  最后一行；扩展没有"再画一个"的钩子。
+  最后一行；扩展没有"再画一个"的钩子，所以本扩展把这一行隐藏，改由自己的按钮行提供 `Latest`。
 - 公开的 `TUI` 接口没有任何 transcript 滚动方法；`TuiAltScreen` 上有 `scrollToTop` / `scrollToBottom` /
   `scrollBy`（公开）和 `scrollToPrompt`（TS `private`，运行时存在）。
 - 扩展拿到的 `tui` 是 InteractiveMode 的稳定 Proxy，会转发到当前 renderer；transcript 的完整渲染行可以通过
@@ -106,7 +116,7 @@ pi install .
 - **仅全屏模式**。普通模式下滚动条归终端，没有可操作的视口。
 - **仅鼠标点击**；键盘用内置的 `ctrl+up` / `ctrl+down`（现在跳到上一个/下一个标签）。
 - 依赖几个非公开实现细节（`AssistantMessageComponent.render` / `markdownSlots`、`UserMessageComponent.render`、
-  `TuiAltScreen.scrollToPrompt`、布局里的 `scrollContentLines`）。Pi 升级后可能需要跟着改；
+  `TuiAltScreen.scrollToPrompt`、`TuiAltScreen.compositeScrollToEndIndicator`、布局里的 `scrollContentLines`）。Pi 升级后可能需要跟着改；
   找不到结构时会退回原生 `scrollToPrompt` 行为。
 - 标签文本和颜色在 `LABEL_PROMPT` / `LABEL_REPLY` / `styledLabel()` 里，可以直接改。
 - 一条 assistant 消息里如果有多段正文，只标第一段；正常对话里通常一段。
