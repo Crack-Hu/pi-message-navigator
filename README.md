@@ -82,26 +82,27 @@ Pi 核心只在这两类消息上写 OSC 133 标记：
 所以：能做，但要 monkey-patch 三个原生方法（user render、assistant render、`scrollToPrompt`）。
 这些是运行时包装，不写盘；`session_shutdown` 时会还原。
 
-## 安装 / 试用
-
-当前项目里已经放在：
-
-```
-.pi/extensions/message-navigator.ts
-```
-
-在会话里执行 `/reload` 即可（新增项目扩展时可能弹一次项目信任确认）。
-单独试用：
+## 安装
 
 ```bash
-pi -e ./message-navigator.ts
+pi install git:github.com/Crack-Hu/pi-message-navigator
 ```
 
-永久安装（本地包）：
+固定分支 / 标签 / commit：
 
 ```bash
-pi install .
+pi install git:github.com/Crack-Hu/pi-message-navigator@main
 ```
+
+安装后重启 pi（或 `/reload`）生效。日常管理：
+
+```bash
+pi list                                     # 查看已安装
+pi update --extensions                      # 更新
+pi remove git:github.com/Crack-Hu/pi-message-navigator
+```
+
+> 私有仓库需要先配置好 SSH key 或 git 凭据。
 
 ## ctrl+t 的紧凑模式
 
