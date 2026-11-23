@@ -14,6 +14,7 @@
 - 短目标落在视口 **1/3** 处，上方留出上一段内容；长目标和很小的视口（1/3 不足 6 行）顶格。
 - 三个按钮在同一行；跟随输出（在底部）时整行隐藏。
 - 用 `Prev` / `Next` 跳转后会暂停"跟随输出"（即使落点就是最后一行），按钮保持可见；点 `Latest` 或手动滚到底部恢复跟随。
+- 跳转后，落点那一行会**红底反色闪两下**（约 470ms），明确告诉你从哪里开始读。
 - 常量在文件顶部：`CONTEXT_FRACTION = 1 / 3`、`MIN_CONTEXT_ROWS = 6`。
 
 ## 紧凑模式（`ctrl+t`）
@@ -50,7 +51,7 @@ Pi 1.6 的 `Container.render()` 会跨帧复用同一个 lines 数组，`Contain
 
 运行时包装的内部方法（`session_shutdown` 全部还原）：
 
-- `AssistantMessageComponent.render`：紧凑模式下把 thinking 标签换成预览行；
+- `UserMessageComponent.render` / `AssistantMessageComponent.render`：跳转后给锚点行加红底闪烁；`AssistantMessageComponent.render` 同时负责紧凑模式下的预览行；
 - `AssistantMessageComponent.handleMouse`：点击 thinking 后固定滚动位置，避免自动跳到新的末尾；
 - `ToolExecutionComponent.render`：折叠组内的工具不渲染；
 - `TuiAltScreen.scrollToPrompt`：改为锚点跳转，找不到时回退原生行为；
@@ -94,6 +95,7 @@ pi remove git:github.com/Crack-Hu/pi-message-navigator
 - `ctrl+t` 的分组依赖「thinking + 同一条 assistant 消息里的 toolCall」；没有 thinking 的工具调用不分组。
 - 一条 assistant 消息里有多段 thinking 时只处理第一段（正常对话通常一段）。
 - `edit` 使用 self-render shell，展开后仍会显示 diff 预览。
+- 闪烁颜色用的是主题的 `error`（偏橙红）；想更亮可以改成固定亮红。
 
 ## 文件
 

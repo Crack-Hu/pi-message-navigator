@@ -86,6 +86,13 @@ interface ThinkingGroup {
 	runIndex: number;
 }
 
+/** A jump target: transcript row, owning component and its line inside it. */
+interface Anchor {
+	row: number;
+	component: unknown;
+	offset: number;
+}
+
 interface PatchState {
 	patched: boolean;
 	/** Stable TUI proxy, used to pin the viewport after a thinking toggle. */
@@ -96,7 +103,11 @@ interface PatchState {
 	groups: Map<string, ThinkingGroup>;
 	/** Stable theme proxy from ctx.ui.theme; used for the preview line. */
 	theme?: Theme;
+	/** Transient flash on the row an anchor jump landed on. */
+	focus?: { component: unknown; offset: number; visible: boolean };
+	focusTimer?: ReturnType<typeof setTimeout>;
 	originals?: {
+		userRender: typeof UserMessageComponent.prototype.render;
 		assistantRender: typeof AssistantMessageComponent.prototype.render;
 		assistantHandleMouse?: AssistantHandleMouseFn;
 		scrollToPrompt: ScrollToPromptFn;
@@ -269,8 +280,8 @@ function findTranscript(tui: unknown): TranscriptView | undefined {
  * `Container.childLines` keeps the rendered lines of each direct child, so the
  * offsets are exact without injecting anything into the transcript.
  */
-function collectAnchors(transcript: TranscriptView): number[] {
-	const anchors: number[] = [];
+function collectAnchors(transcript: TranscriptView): Anchor[] {
+	const anchors: Anchor[] = [];
 	const visit = (container: unknown, baseRow: number): void => {
 		const layout = (container as { childLines?: ChildLines } | undefined)?.childLines;
 		if (!layout?.children || !Array.isArray(layout.parts)) return;
@@ -281,10 +292,10 @@ function collectAnchors(transcript: TranscriptView): number[] {
 			const height = layout.parts[i]?.length ?? 0;
 			if (child instanceof UserMessageComponent) {
 				// The message starts with one row of Markdown top padding.
-				anchors.push(row + 1);
+				anchors.push({ row: row + 1, component: child, offset: 1 });
 			} else if (child instanceof AssistantMessageComponent) {
 				const offset = firstTextLineOffset(child as unknown as AssistantRuntime, width);
-				if (offset !== undefined) anchors.push(row + offset);
+				if (offset !== undefined) anchors.push({ row: row + offset, component: child, offset });
 			} else if ((child as { childLines?: ChildLines })?.childLines) {
 				visit(child, row);
 			}
@@ -296,14 +307,15 @@ function collectAnchors(transcript: TranscriptView): number[] {
 }
 
 /**
- * Landing row for a jump. Short blocks get one third of the viewport of
- * context above them; long blocks and small viewports keep the anchor on top.
+ * Landing row for a jump. Only the viewport size matters: large screens get one
+ * third of the viewport as context, small screens leave max(2, height/8) rows.
+ * A long message is still anchored the same way; the user can scroll.
  */
-function landingRow(scrollView: TranscriptView["scrollView"], lines: string[], anchors: number[], row: number): number {
+function landingRow(scrollView: TranscriptView["scrollView"], lines: string[], anchors: Anchor[], row: number): number {
 	const viewportHeight = typeof scrollView.viewportHeight === "number" ? scrollView.viewportHeight : 0;
 	const contextRows = Math.floor(viewportHeight * CONTEXT_FRACTION);
 	if (contextRows < MIN_CONTEXT_ROWS) return row;
-	const next = anchors.find((anchor) => anchor > row) ?? lines.length;
+	const next = anchors.find((anchor) => anchor.row > row)?.row ?? lines.length;
 	const blockHeight = next - row;
 	if (blockHeight > viewportHeight - contextRows) return row;
 	return Math.max(0, row - contextRows);
@@ -315,30 +327,95 @@ function jumpToAnchor(tui: unknown, direction: -1 | 1): boolean {
 	const anchors = collectAnchors(transcript);
 	if (anchors.length === 0) return false;
 	const top = transcript.scrollView.scrollTop;
-	let row: number | undefined;
+	let target: Anchor | undefined;
 	if (direction < 0) {
 		for (let i = anchors.length - 1; i >= 0; i--) {
-			if ((anchors[i] ?? 0) < top) {
-				row = anchors[i];
+			const anchor = anchors[i];
+			if (anchor && anchor.row < top) {
+				target = anchor;
 				break;
 			}
 		}
 	} else {
 		for (const anchor of anchors) {
-			if (anchor > top) {
-				row = anchor;
+			if (anchor.row > top) {
+				target = anchor;
 				break;
 			}
 		}
 	}
-	if (row === undefined) return false;
+	if (!target) return false;
 	// Browsing: never re-enter follow mode just because the target is the last
 	// row. The chip row stays visible and new output does not yank the viewport.
-	transcript.scrollView.scrollTo(landingRow(transcript.scrollView, transcript.lines, anchors, row), {
+	transcript.scrollView.scrollTo(landingRow(transcript.scrollView, transcript.lines, anchors, target.row), {
 		disableFollow: true,
 	});
+	startAnchorFlash(getState(), target);
 	(tui as { requestRender?: () => void }).requestRender?.();
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Focus flash
+// ---------------------------------------------------------------------------
+
+/** Red band over the landing row for a short moment. */
+function flashAnchorLine(lines: string[], offset: number, width: number, state: PatchState): void {
+	if (offset < 0 || offset >= lines.length) return;
+	const line = lines[offset] ?? "";
+	if (line.includes("\x1b_G") || line.includes("\x1b]1337;File=")) return;
+	const plain = truncateToWidth(stripTerminalSequences(line), width, "");
+	const padded = plain + " ".repeat(Math.max(0, width - visibleWidth(plain)));
+	const theme = state.theme;
+	try {
+		// `error` is a foreground token; `bg("error")` throws. Use the concrete
+		// color in a style so it works in either slot.
+		lines[offset] = theme ? theme.style(padded, { bg: theme.colors.error, fg: "text" }) : padded;
+	} catch {
+		lines[offset] = padded;
+	}
+}
+
+function clearAnchorFlash(state: PatchState): void {
+	if (state.focusTimer) clearTimeout(state.focusTimer);
+	state.focusTimer = undefined;
+	state.focus = undefined;
+}
+
+function startAnchorFlash(state: PatchState, anchor: Anchor): void {
+	clearAnchorFlash(state);
+	const focus = { component: anchor.component, offset: anchor.offset, visible: true };
+	state.focus = focus;
+	const render = () => (state.tui as { requestRender?: () => void } | undefined)?.requestRender?.();
+	// Two pulses: on -> off -> on -> off.
+	const steps: Array<{ visible: boolean; ms: number }> = [
+		{ visible: true, ms: 170 },
+		{ visible: false, ms: 130 },
+		{ visible: true, ms: 170 },
+		{ visible: false, ms: 0 },
+	];
+	let index = 0;
+	const tick = (): void => {
+		if (state.focus !== focus) return; // cleared or replaced by a newer jump
+		const step = steps[index++];
+		if (!step) {
+			state.focus = undefined;
+			state.focusTimer = undefined;
+			render();
+			return;
+		}
+		focus.visible = step.visible;
+		render();
+		if (step.ms > 0) {
+			state.focusTimer = setTimeout(tick, step.ms);
+			state.focusTimer.unref?.();
+		} else {
+			state.focus = undefined;
+			state.focusTimer = undefined;
+			render();
+		}
+	};
+	tick();
 }
 
 // ---------------------------------------------------------------------------
@@ -348,16 +425,28 @@ function jumpToAnchor(tui: unknown, direction: -1 | 1): boolean {
 function installPatches(state: PatchState): void {
 	if (state.patched) return;
 
+	const userRender = UserMessageComponent.prototype.render;
+	UserMessageComponent.prototype.render = function (this: UserMessageComponent, width: number): string[] {
+		const original = userRender.call(this, width);
+		if (state.focus?.component !== this || !state.focus.visible) return original;
+		const lines = [...original];
+		flashAnchorLine(lines, state.focus.offset, width, state);
+		return lines;
+	};
+
 	const assistantRender = assistantProto.render;
 	assistantProto.render = function (this: AssistantMessageComponent, width: number): string[] {
 		const runtime = this as unknown as AssistantRuntime;
 		state.compactThinking = runtime.hideThinkingBlock === true;
 		const original = assistantRender.call(this, width);
-		if (!state.compactThinking || !runtime.lastMessage?.content) return original;
-		// Container.render reuses its array across frames; copy before replacing
-		// the thinking label with the group preview.
+		const focused = state.focus?.component === this && state.focus.visible;
+		if (!focused && (!state.compactThinking || !runtime.lastMessage?.content)) return original;
+		// Container.render reuses its array across frames; copy before modifying.
 		const lines = [...original];
-		registerThinkingGroup(state, runtime, runtime.lastMessage.content, lines, width);
+		if (state.compactThinking && runtime.lastMessage?.content) {
+			registerThinkingGroup(state, runtime, runtime.lastMessage.content, lines, width);
+		}
+		if (focused) flashAnchorLine(lines, state.focus?.offset ?? 0, width, state);
 		return lines;
 	};
 
@@ -411,6 +500,7 @@ function installPatches(state: PatchState): void {
 	};
 
 	state.originals = {
+		userRender,
 		assistantRender,
 		assistantHandleMouse,
 		scrollToPrompt,
@@ -424,6 +514,7 @@ function installPatches(state: PatchState): void {
 function removePatches(state: PatchState): void {
 	const originals = state.originals;
 	if (!state.patched || !originals) return;
+	UserMessageComponent.prototype.render = originals.userRender;
 	assistantProto.render = originals.assistantRender;
 	if (originals.assistantHandleMouse) assistantProto.handleMouse = originals.assistantHandleMouse;
 	else delete assistantProto.handleMouse;
@@ -435,6 +526,7 @@ function removePatches(state: PatchState): void {
 	state.patched = false;
 	state.compactThinking = false;
 	state.groups.clear();
+	clearAnchorFlash(state);
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +657,7 @@ export default function messageNavigatorExtension(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		state.groups.clear();
 		state.compactThinking = false;
+		clearAnchorFlash(state);
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		// Stable proxy: reflects later /theme changes automatically.
 		state.theme = ctx.ui.theme;
