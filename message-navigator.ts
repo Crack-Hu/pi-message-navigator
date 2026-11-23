@@ -355,7 +355,9 @@ function installPatches(state: PatchState): void {
 
 	const userRender = UserMessageComponent.prototype.render;
 	UserMessageComponent.prototype.render = function (this: UserMessageComponent, width: number): string[] {
-		const lines = userRender.call(this, width);
+		// Container.render reuses its lines array across frames; copy before
+		// inserting rows so labels do not accumulate every frame.
+		const lines = [...userRender.call(this, width)];
 		labelUserMessage(lines, state);
 		return lines;
 	};
@@ -364,7 +366,8 @@ function installPatches(state: PatchState): void {
 	AssistantMessageComponent.prototype.render = function (this: AssistantMessageComponent, width: number): string[] {
 		const runtime = this as unknown as AssistantRuntime;
 		state.compactThinking = runtime.hideThinkingBlock === true;
-		const lines = assistantRender.call(this, width);
+		// Copy: the original may return a cached array shared across frames.
+		const lines = [...assistantRender.call(this, width)];
 		if (state.compactThinking && runtime.lastMessage?.content) {
 			registerThinkingGroup(state, runtime, runtime.lastMessage.content, lines, width);
 		}
