@@ -10,8 +10,8 @@
  * - `ctrl+end` / `↓ Latest` jump to the bottom
  *
  * An anchor is the first text row of a user message or the first white (text)
- * block of an assistant message. Short targets land one third down the
- * viewport; long targets and small viewports keep the anchor at the top.
+ * block of an assistant message. Large viewports put it one third down; small
+ * viewports leave max(2, viewport/8) rows above it. Message length is ignored.
  *
  * Compact mode follows `hideThinkingBlock` (ctrl+t): a thinking run plus the
  * tool calls of the same assistant message form one group. While the thinking
@@ -43,10 +43,14 @@ import {
 const WIDGET_KEY = "message-navigator";
 const WIDGET_PLACEMENT = "aboveEditor" as const;
 
-/** When a block fits, its anchor lands this fraction down the viewport. */
+/** Large viewports: anchor lands this fraction down the viewport. */
 const CONTEXT_FRACTION = 1 / 3;
-/** Below this many rows of breathing room, top-align instead (small windows/phones). */
+/** 1/3 of the viewport must be at least this many rows to count as "large". */
 const MIN_CONTEXT_ROWS = 6;
+/** Small viewports: leading rows are viewportHeight / this. */
+const SMALL_CONTEXT_DIVISOR = 8;
+/** Small viewports never hug the top edge (looks cramped). */
+const MIN_SMALL_CONTEXT_ROWS = 2;
 
 // ---------------------------------------------------------------------------
 // Shared state (survives /reload: the prototypes stay patched in-process)
@@ -311,14 +315,12 @@ function collectAnchors(transcript: TranscriptView): Anchor[] {
  * third of the viewport as context, small screens leave max(2, height/8) rows.
  * A long message is still anchored the same way; the user can scroll.
  */
-function landingRow(scrollView: TranscriptView["scrollView"], lines: string[], anchors: Anchor[], row: number): number {
+function landingRow(scrollView: TranscriptView["scrollView"], row: number): number {
 	const viewportHeight = typeof scrollView.viewportHeight === "number" ? scrollView.viewportHeight : 0;
-	const contextRows = Math.floor(viewportHeight * CONTEXT_FRACTION);
-	if (contextRows < MIN_CONTEXT_ROWS) return row;
-	const next = anchors.find((anchor) => anchor.row > row)?.row ?? lines.length;
-	const blockHeight = next - row;
-	if (blockHeight > viewportHeight - contextRows) return row;
-	return Math.max(0, row - contextRows);
+	const third = Math.floor(viewportHeight * CONTEXT_FRACTION);
+	const offset =
+		third >= MIN_CONTEXT_ROWS ? third : Math.max(MIN_SMALL_CONTEXT_ROWS, Math.floor(viewportHeight / SMALL_CONTEXT_DIVISOR));
+	return Math.max(0, row - offset);
 }
 
 function jumpToAnchor(tui: unknown, direction: -1 | 1): boolean {
@@ -347,7 +349,7 @@ function jumpToAnchor(tui: unknown, direction: -1 | 1): boolean {
 	if (!target) return false;
 	// Browsing: never re-enter follow mode just because the target is the last
 	// row. The chip row stays visible and new output does not yank the viewport.
-	transcript.scrollView.scrollTo(landingRow(transcript.scrollView, transcript.lines, anchors, target.row), {
+	transcript.scrollView.scrollTo(landingRow(transcript.scrollView, target.row), {
 		disableFollow: true,
 	});
 	startAnchorFlash(getState(), target);
