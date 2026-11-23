@@ -13,6 +13,7 @@
 - 只把用户消息和 assistant 的白字正文作为锚点；thinking、工具调用/结果不参与。
 - 短目标落在视口 **1/3** 处，上方留出上一段内容；长目标和很小的视口（1/3 不足 6 行）顶格。
 - 三个按钮在同一行；跟随输出（在底部）时整行隐藏。
+- 用 `Prev` / `Next` 跳转后会暂停"跟随输出"（即使落点就是最后一行），按钮保持可见；点 `Latest` 或手动滚到底部恢复跟随。
 - 常量在文件顶部：`CONTEXT_FRACTION = 1 / 3`、`MIN_CONTEXT_ROWS = 6`。
 
 ## 紧凑模式（`ctrl+t`）
@@ -26,8 +27,9 @@ Pi 原生只有两个开关：
 
 本扩展把「一段 thinking + 紧随其后的工具调用（和结果）」视为**一个整体块**：
 
-- `ctrl+t` 隐藏 thinking 时，整块折叠成一行：`▸ 这段思考的前 N 列…`（超出宽度自动加省略号）；
+- `ctrl+t` 隐藏 thinking 时，整块折叠成一行：`▌ 这段思考的前 N 列…`（超出宽度自动加省略号）；
 - **点击这一行** → 展开完整 thinking + 工具调用/结果；再点收起；
+- 展开时会取消"跟随输出"并保持当前滚动位置，思考从原来的位置向下展开，不会跳到末尾；
 - 折叠时该组的工具组件完全不渲染；
 - `ctrl+o` 仍然只控制展开后工具结果的预览/完整输出；
 - 没有 thinking 的独立工具调用不参与分组，按原生行为显示；
@@ -49,6 +51,7 @@ Pi 1.6 的 `Container.render()` 会跨帧复用同一个 lines 数组，`Contain
 运行时包装的内部方法（`session_shutdown` 全部还原）：
 
 - `AssistantMessageComponent.render`：紧凑模式下把 thinking 标签换成预览行；
+- `AssistantMessageComponent.handleMouse`：点击 thinking 后固定滚动位置，避免自动跳到新的末尾；
 - `ToolExecutionComponent.render`：折叠组内的工具不渲染；
 - `TuiAltScreen.scrollToPrompt`：改为锚点跳转，找不到时回退原生行为；
 - `TuiAltScreen.compositeScrollToEndIndicator`：隐藏内置的 "↓ Jump to latest message" 胶囊，由按钮行的 `Latest` 取代；

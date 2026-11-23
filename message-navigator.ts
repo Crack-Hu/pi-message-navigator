@@ -66,6 +66,15 @@ const interactiveProto = InteractiveMode.prototype as unknown as {
 	updateThinkingBlockVisibility: UpdateThinkingVisibilityFn;
 };
 
+type AssistantHandleMouseFn = (
+	this: AssistantMessageComponent,
+	event: TuiMouseEvent,
+) => TuiMouseEventResult | undefined;
+const assistantProto = AssistantMessageComponent.prototype as unknown as {
+	render: (this: AssistantMessageComponent, width: number) => string[];
+	handleMouse?: AssistantHandleMouseFn;
+};
+
 /** Tool rendering hook: group members hide while their thinking is collapsed. */
 interface ToolRuntime {
 	toolCallId?: string;
@@ -79,6 +88,8 @@ interface ThinkingGroup {
 
 interface PatchState {
 	patched: boolean;
+	/** Stable TUI proxy, used to pin the viewport after a thinking toggle. */
+	tui?: unknown;
 	/** True while thinking blocks are hidden; thinking+tool groups collapse. */
 	compactThinking: boolean;
 	/** toolCallId -> thinking group that owns it. */
@@ -87,6 +98,7 @@ interface PatchState {
 	theme?: Theme;
 	originals?: {
 		assistantRender: typeof AssistantMessageComponent.prototype.render;
+		assistantHandleMouse?: AssistantHandleMouseFn;
 		scrollToPrompt: ScrollToPromptFn;
 		compositeIndicator: CompositeIndicatorFn;
 		updateThinkingVisibility: UpdateThinkingVisibilityFn;
@@ -148,13 +160,13 @@ function isThinkingHidden(component: AssistantRuntime, runIndex: number): boolea
 /** One-line group header: "▸ <first N columns of the thinking>…". */
 function buildThinkingPreview(component: AssistantRuntime, thinking: string, width: number, state: PatchState): string {
 	const plain = thinking.replace(/\s+/g, " ").trim();
-	const prefix = "▸ ";
 	const indent = " ".repeat(Math.max(0, component.outputPad ?? 0));
-	const available = Math.max(12, width - indent.length - prefix.length);
+	const available = Math.max(12, width - indent.length - 2);
 	const preview = truncateToWidth(plain, available, "…");
-	const text = `${prefix}${preview}`;
-	const styled = state.theme ? state.theme.italic(state.theme.fg("thinkingText", text)) : text;
-	return indent + styled;
+	const theme = state.theme;
+	const marker = theme ? theme.fg("accent", "▌") : "▌";
+	const body = theme ? theme.fg("muted", preview) : preview;
+	return `${indent}${marker} ${body}`;
 }
 
 function replaceThinkingLabel(lines: string[], label: string, replacement: string): void {
@@ -223,7 +235,7 @@ interface ChildLines {
 interface TranscriptView {
 	scrollView: {
 		scrollTop: number;
-		scrollTo(row: number): void;
+		scrollTo(row: number, options?: { disableFollow?: boolean }): void;
 		scrollToEnd?: () => void;
 		readonly viewportHeight?: number;
 	};
@@ -320,7 +332,11 @@ function jumpToAnchor(tui: unknown, direction: -1 | 1): boolean {
 		}
 	}
 	if (row === undefined) return false;
-	transcript.scrollView.scrollTo(landingRow(transcript.scrollView, transcript.lines, anchors, row));
+	// Browsing: never re-enter follow mode just because the target is the last
+	// row. The chip row stays visible and new output does not yank the viewport.
+	transcript.scrollView.scrollTo(landingRow(transcript.scrollView, transcript.lines, anchors, row), {
+		disableFollow: true,
+	});
 	(tui as { requestRender?: () => void }).requestRender?.();
 	return true;
 }
@@ -332,8 +348,8 @@ function jumpToAnchor(tui: unknown, direction: -1 | 1): boolean {
 function installPatches(state: PatchState): void {
 	if (state.patched) return;
 
-	const assistantRender = AssistantMessageComponent.prototype.render;
-	AssistantMessageComponent.prototype.render = function (this: AssistantMessageComponent, width: number): string[] {
+	const assistantRender = assistantProto.render;
+	assistantProto.render = function (this: AssistantMessageComponent, width: number): string[] {
 		const runtime = this as unknown as AssistantRuntime;
 		state.compactThinking = runtime.hideThinkingBlock === true;
 		const original = assistantRender.call(this, width);
@@ -343,6 +359,20 @@ function installPatches(state: PatchState): void {
 		const lines = [...original];
 		registerThinkingGroup(state, runtime, runtime.lastMessage.content, lines, width);
 		return lines;
+	};
+
+	// Expanding a thinking group grows the transcript. If the viewport was
+	// following the end, the ScrollView would snap to the new bottom and show
+	// the end of the thinking. Pinning scrollTop with follow disabled keeps the
+	// preview row in place so the expanded text starts where it was clicked.
+	const assistantHandleMouse = assistantProto.handleMouse;
+	assistantProto.handleMouse = function (this: AssistantMessageComponent, event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const result = assistantHandleMouse?.call(this, event);
+		if (result?.handled && state.compactThinking && state.tui) {
+			const transcript = findTranscript(state.tui);
+			if (transcript) transcript.scrollView.scrollTo(transcript.scrollView.scrollTop, { disableFollow: true });
+		}
+		return result;
 	};
 
 	// Retarget Pi's prompt jumping at message anchors instead of OSC markers.
@@ -382,6 +412,7 @@ function installPatches(state: PatchState): void {
 
 	state.originals = {
 		assistantRender,
+		assistantHandleMouse,
 		scrollToPrompt,
 		compositeIndicator,
 		updateThinkingVisibility,
@@ -393,7 +424,9 @@ function installPatches(state: PatchState): void {
 function removePatches(state: PatchState): void {
 	const originals = state.originals;
 	if (!state.patched || !originals) return;
-	AssistantMessageComponent.prototype.render = originals.assistantRender;
+	assistantProto.render = originals.assistantRender;
+	if (originals.assistantHandleMouse) assistantProto.handleMouse = originals.assistantHandleMouse;
+	else delete assistantProto.handleMouse;
 	altScreenProto.scrollToPrompt = originals.scrollToPrompt;
 	altScreenProto.compositeScrollToEndIndicator = originals.compositeIndicator;
 	interactiveProto.updateThinkingBlockVisibility = originals.updateThinkingVisibility;
@@ -535,6 +568,13 @@ export default function messageNavigatorExtension(pi: ExtensionAPI) {
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		// Stable proxy: reflects later /theme changes automatically.
 		state.theme = ctx.ui.theme;
-		ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => new NavigationChips(tui, theme), { placement: WIDGET_PLACEMENT });
+		ctx.ui.setWidget(
+			WIDGET_KEY,
+			(tui, theme) => {
+				state.tui = tui;
+				return new NavigationChips(tui, theme);
+			},
+			{ placement: WIDGET_PLACEMENT },
+		);
 	});
 }
