@@ -82,8 +82,22 @@ const assistantProto = AssistantMessageComponent.prototype as unknown as {
 /** Tool rendering hook: group members hide while their thinking is collapsed. */
 interface ToolRuntime {
 	toolCallId?: string;
+	expanded?: boolean;
+	result?: { isError?: boolean };
+	contentBox?: { children?: unknown[]; removeChild(component: unknown): void };
+	hasRendererDefinition?: () => boolean;
+	getRenderShell?: () => string;
+	/** Last compact/group state, used to rebuild the tool lazily. */
+	compactState?: boolean;
+	inGroup?: boolean;
+	groupHidden?: boolean;
 }
 type ToolRenderFn = (this: ToolRuntime, width: number) => string[];
+type ToolUpdateDisplayFn = (this: ToolRuntime) => void;
+const toolProto = ToolExecutionComponent.prototype as unknown as {
+	render: ToolRenderFn;
+	updateDisplay: ToolUpdateDisplayFn;
+};
 
 interface ThinkingGroup {
 	assistant: AssistantRuntime;
@@ -122,6 +136,7 @@ interface PatchState {
 		compositeIndicator: CompositeIndicatorFn;
 		updateThinkingVisibility: UpdateThinkingVisibilityFn;
 		toolRender: ToolRenderFn;
+		toolUpdateDisplay: ToolUpdateDisplayFn;
 	};
 }
 
@@ -239,6 +254,20 @@ function registerThinkingGroup(
 	for (const call of toolCalls) state.groups.set(call.id as string, { assistant: component, runIndex });
 	if (!isThinkingHidden(component, runIndex)) return;
 	replaceThinkingLabel(lines, component.hiddenThinkingLabel ?? "", buildThinkingPreview(component, thinking, width, state));
+}
+
+/**
+ * No-thinking tools have no group header. In compact mode keep their one-line
+ * call block and drop the result; clicking the call block expands it again.
+ */
+function collapseCompactResult(component: ToolRuntime): void {
+	if (!component.result) return;
+	if (!component.hasRendererDefinition?.() || component.getRenderShell?.() === "self") return;
+	const box = component.contentBox;
+	const children = box?.children;
+	if (!box || !children || children.length < 2) return;
+	// Children are [call, result]; keep the call row.
+	box.removeChild(children[children.length - 1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -512,13 +541,33 @@ function installPatches(state: PatchState): void {
 	// Group members vanish while their thinking run is collapsed. The group
 	// header is the native thinking label line, so clicking it expands both the
 	// thinking and the tools (results still follow ctrl+o once visible).
-	const toolRender = ToolExecutionComponent.prototype.render as ToolRenderFn;
-	const toolProto = ToolExecutionComponent.prototype as unknown as { render: ToolRenderFn };
+	// Tools without a thinking group compact to their call row (result hidden).
+	// Group members keep native display; the render wrapper below hides them
+	// entirely while their thinking is collapsed.
+	const toolUpdateDisplay = toolProto.updateDisplay;
+	toolProto.updateDisplay = function (this: ToolRuntime): void {
+		toolUpdateDisplay.call(this);
+		if (!state.compactThinking) return;
+		const group = this.toolCallId ? state.groups.get(this.toolCallId) : undefined;
+		if (group) return;
+		if (!this.expanded) collapseCompactResult(this);
+	};
+
+	const toolRender = toolProto.render;
 	toolProto.render = function (this: ToolRuntime, width: number): string[] {
-		if (state.compactThinking && this.toolCallId) {
-			const group = state.groups.get(this.toolCallId);
-			if (group && isThinkingHidden(group.assistant, group.runIndex)) return [];
+		const group = this.toolCallId ? state.groups.get(this.toolCallId) : undefined;
+		const inGroup = Boolean(group);
+		const groupHidden = Boolean(group && isThinkingHidden(group.assistant, group.runIndex));
+		if (this.compactState !== state.compactThinking || this.inGroup !== inGroup || this.groupHidden !== groupHidden) {
+			const enteringCompact = state.compactThinking && this.compactState !== true;
+			this.compactState = state.compactThinking;
+			this.inGroup = inGroup;
+			this.groupHidden = groupHidden;
+			// ctrl+t folds no-thinking tools even if ctrl+o had expanded them.
+			if (enteringCompact && !inGroup) this.expanded = false;
+			toolProto.updateDisplay.call(this);
 		}
+		if (state.compactThinking && groupHidden) return [];
 		return toolRender.call(this, width);
 	};
 
@@ -530,6 +579,7 @@ function installPatches(state: PatchState): void {
 		compositeIndicator,
 		updateThinkingVisibility,
 		toolRender,
+		toolUpdateDisplay,
 	};
 	state.patched = true;
 }
@@ -544,7 +594,8 @@ function removePatches(state: PatchState): void {
 	altScreenProto.scrollToPrompt = originals.scrollToPrompt;
 	altScreenProto.compositeScrollToEndIndicator = originals.compositeIndicator;
 	interactiveProto.updateThinkingBlockVisibility = originals.updateThinkingVisibility;
-	(ToolExecutionComponent.prototype as unknown as { render: ToolRenderFn }).render = originals.toolRender;
+	toolProto.render = originals.toolRender;
+	toolProto.updateDisplay = originals.toolUpdateDisplay;
 	state.originals = undefined;
 	state.patched = false;
 	state.compactThinking = false;
