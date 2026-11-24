@@ -36,7 +36,9 @@ Pi 原生只有两个开关：
 - 展开时会取消"跟随输出"并保持当前滚动位置，思考从原来的位置向下展开，不会跳到末尾；
 - 折叠时该组的工具组件完全不渲染；
 - `ctrl+o` 仍然只控制展开后工具结果的预览/完整输出；
-- 没有 thinking 的工具调用不参与分组，在紧凑模式下折叠成一行调用块（只保留调用行），点击展开结果；
+- 没有 thinking 的 AI 工具调用不参与分组，在紧凑模式下显示一行 **`▌ …` 摘要**（超宽截断），点击在摘要和完整工具之间切换（结果展开仍用 `ctrl+o`）；
+- 展开的思考组里，点击任意工具块会收起整个组；
+- 你自己用 `!` 执行的 bash 不属于 AI 工具，保持完整显示，不参与紧凑模式；
 - `edit` 展开后按原样显示（含 diff 预览）。
 
 预览行就是 Pi 原生 thinking 标签的位置，所以点击复用原生逻辑；分组状态只存在于渲染层，不写会话文件、不进模型上下文。
@@ -56,7 +58,7 @@ Pi 1.6 的 `Container.render()` 会跨帧复用同一个 lines 数组，`Contain
 
 - `UserMessageComponent.render` / `AssistantMessageComponent.render`：跳转后给锚点行加红底闪烁；`AssistantMessageComponent.render` 同时负责紧凑模式下的预览行；
 - `AssistantMessageComponent.handleMouse`：点击 thinking 后固定滚动位置，避免自动跳到新的末尾；
-- `ToolExecutionComponent.render` / `updateDisplay`：折叠组内的工具不渲染；没有 thinking 的工具只保留调用行；
+- `ToolExecutionComponent.render` / `handleMouse`：有 thinking 组时隐藏/按展开显示，点击组内工具收起整组；没有组时渲染一行摘要，点击切换摘要/完整工具；
 - `TuiAltScreen.scrollToPrompt`：改为锚点跳转，找不到时回退原生行为；
 - `TuiAltScreen.compositeScrollToEndIndicator`：隐藏内置的 "↓ Jump to latest message" 胶囊，由按钮行的 `Latest` 取代；
 - `InteractiveMode.updateThinkingBlockVisibility`：同步紧凑状态。
@@ -95,9 +97,9 @@ pi remove git:github.com/Crack-Hu/pi-message-navigator
 
 - **仅全屏模式**（`tuiMode: "fullscreen"`）。
 - 只能定位**已经渲染过至少一帧**的消息；首帧之前没有 `childLines`，跳转会回退到 Pi 原生的 OSC 标记。
-- `ctrl+t` 的分组依赖「thinking + 同一条 assistant 消息里的 toolCall」；没有 thinking 的工具调用不分组，但会折叠成一行调用块。
+- `ctrl+t` 的分组依赖「thinking + 同一条 assistant 消息里的 toolCall」；没有 thinking 的工具调用不分组，显示一行摘要。
 - 一条 assistant 消息里有多段 thinking 时只处理第一段（正常对话通常一段）。
-- `edit` 使用 self-render shell，没有 thinking 时不会折叠（调用行里带 diff 预览）。
+- `edit` 没有 thinking 时摘要为 `▌ edit path`，点击展开完整 diff。
 - 闪烁颜色用的是主题的 `error`（偏橙红）；想更亮可以改成固定亮红。
 
 ## 文件

@@ -82,21 +82,21 @@ const assistantProto = AssistantMessageComponent.prototype as unknown as {
 /** Tool rendering hook: group members hide while their thinking is collapsed. */
 interface ToolRuntime {
 	toolCallId?: string;
+	toolName?: string;
+	args?: Record<string, unknown>;
 	expanded?: boolean;
-	result?: { isError?: boolean };
-	contentBox?: { children?: unknown[]; removeChild(component: unknown): void };
-	hasRendererDefinition?: () => boolean;
+	outputPad?: number;
+	contentBox?: { render(width: number): string[] };
+	selfRenderContainer?: { render(width: number): string[] };
 	getRenderShell?: () => string;
-	/** Last compact/group state, used to rebuild the tool lazily. */
 	compactState?: boolean;
-	inGroup?: boolean;
-	groupHidden?: boolean;
+	setExpanded?: (expanded: boolean) => void;
 }
 type ToolRenderFn = (this: ToolRuntime, width: number) => string[];
-type ToolUpdateDisplayFn = (this: ToolRuntime) => void;
+type ToolHandleMouseFn = (this: ToolRuntime, event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 const toolProto = ToolExecutionComponent.prototype as unknown as {
 	render: ToolRenderFn;
-	updateDisplay: ToolUpdateDisplayFn;
+	handleMouse?: ToolHandleMouseFn;
 };
 
 interface ThinkingGroup {
@@ -121,6 +121,8 @@ interface PatchState {
 	groups: Map<string, ThinkingGroup>;
 	/** Stable theme proxy from ctx.ui.theme; used for the preview line. */
 	theme?: Theme;
+	/** Whether the last visible rendered line was a `▌` preview/summary. */
+	lastVisibleWasBar?: boolean;
 	/** Transient flash on the row an anchor jump landed on. */
 	focus?: { component: unknown; offset: number; visible: boolean };
 	/** Index of the anchor the last jump landed on, for Prev/Next chaining. */
@@ -136,7 +138,7 @@ interface PatchState {
 		compositeIndicator: CompositeIndicatorFn;
 		updateThinkingVisibility: UpdateThinkingVisibilityFn;
 		toolRender: ToolRenderFn;
-		toolUpdateDisplay: ToolUpdateDisplayFn;
+		toolHandleMouse?: ToolHandleMouseFn;
 	};
 }
 
@@ -163,6 +165,7 @@ interface MarkdownChild {
 interface AssistantRuntime {
 	markdownSlots?: Array<{ kind?: string; markdown?: MarkdownChild }>;
 	contentContainer?: { children?: MarkdownChild[] };
+	updateContent?(message: unknown): void;
 	lastMessage?: { content?: Array<{ type?: string; text?: string; thinking?: string; id?: string }> };
 	hideThinkingBlock?: boolean;
 	thinkingVisibilityOverrides?: Map<number, boolean>;
@@ -219,6 +222,45 @@ function replaceThinkingLabel(lines: string[], label: string, replacement: strin
  * Thinking blocks and the hidden-thinking label have kind "thinking" or are
  * plain Text children, so they are skipped.
  */
+/** True when the last visible line of a component is a `▌` preview/summary. */
+function endsWithBar(lines: string[]): boolean {
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const plain = stripTerminalSequences(lines[i] ?? "").trim();
+		if (!plain) continue;
+		return plain.includes("▌");
+	}
+	return false;
+}
+
+/** One-line summary for a tool that has no thinking group: `▌ $ command…`. */
+function buildToolSummary(component: ToolRuntime, width: number, state: PatchState): string {
+	let line = "";
+	try {
+		if (component.getRenderShell?.() === "self") {
+			// Self-rendered tools (edit) draw their diff inside the call block.
+			// Use the tool name and path instead of rendering the whole diff.
+			const args = component.args ?? {};
+			const target = args.path ?? args.file_path ?? "";
+			line = `${component.toolName ?? "tool"}${target ? ` ${String(target)}` : ""}`;
+		} else {
+			// Render wide enough to get the full first call line, then truncate.
+			const lines = component.contentBox?.render(Math.max(width, 1000)) ?? [];
+			const firstContent = lines.find((candidate) => stripTerminalSequences(candidate).trim().length > 0) ?? "";
+			line = stripTerminalSequences(firstContent).trim();
+		}
+	} catch {
+		line = "";
+	}
+	if (!line.trim()) line = component.toolName ?? "tool";
+	const indent = " ".repeat(Math.max(0, component.outputPad ?? 0));
+	const available = Math.max(12, width - indent.length - 2);
+	const preview = truncateToWidth(line, available, "…");
+	const theme = state.theme;
+	const marker = theme ? theme.fg("accent", "▌") : "▌";
+	const body = theme ? theme.fg("muted", preview) : preview;
+	return `${indent}${marker} ${body}`;
+}
+
 function firstTextLineOffset(component: AssistantRuntime, width: number): number | undefined {
 	const slots = component.markdownSlots;
 	const children = component.contentContainer?.children;
@@ -254,20 +296,6 @@ function registerThinkingGroup(
 	for (const call of toolCalls) state.groups.set(call.id as string, { assistant: component, runIndex });
 	if (!isThinkingHidden(component, runIndex)) return;
 	replaceThinkingLabel(lines, component.hiddenThinkingLabel ?? "", buildThinkingPreview(component, thinking, width, state));
-}
-
-/**
- * No-thinking tools have no group header. In compact mode keep their one-line
- * call block and drop the result; clicking the call block expands it again.
- */
-function collapseCompactResult(component: ToolRuntime): void {
-	if (!component.result) return;
-	if (!component.hasRendererDefinition?.() || component.getRenderShell?.() === "self") return;
-	const box = component.contentBox;
-	const children = box?.children;
-	if (!box || !children || children.length < 2) return;
-	// Children are [call, result]; keep the call row.
-	box.removeChild(children[children.length - 1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +508,7 @@ function installPatches(state: PatchState): void {
 	const userRender = UserMessageComponent.prototype.render;
 	UserMessageComponent.prototype.render = function (this: UserMessageComponent, width: number): string[] {
 		const original = userRender.call(this, width);
+		if (original.length > 0) state.lastVisibleWasBar = false;
 		if (state.focus?.component !== this || !state.focus.visible) return original;
 		const lines = [...original];
 		flashAnchorLine(lines, state.focus.offset, width, state);
@@ -492,13 +521,17 @@ function installPatches(state: PatchState): void {
 		state.compactThinking = runtime.hideThinkingBlock === true;
 		const original = assistantRender.call(this, width);
 		const focused = state.focus?.component === this && state.focus.visible;
-		if (!focused && (!state.compactThinking || !runtime.lastMessage?.content)) return original;
+		if (!focused && (!state.compactThinking || !runtime.lastMessage?.content)) {
+			if (original.length > 0) state.lastVisibleWasBar = endsWithBar(original);
+			return original;
+		}
 		// Container.render reuses its array across frames; copy before modifying.
 		const lines = [...original];
 		if (state.compactThinking && runtime.lastMessage?.content) {
 			registerThinkingGroup(state, runtime, runtime.lastMessage.content, lines, width);
 		}
 		if (focused) flashAnchorLine(lines, state.focus?.offset ?? 0, width, state);
+		if (lines.length > 0) state.lastVisibleWasBar = endsWithBar(lines);
 		return lines;
 	};
 
@@ -541,34 +574,57 @@ function installPatches(state: PatchState): void {
 	// Group members vanish while their thinking run is collapsed. The group
 	// header is the native thinking label line, so clicking it expands both the
 	// thinking and the tools (results still follow ctrl+o once visible).
-	// Tools without a thinking group compact to their call row (result hidden).
-	// Group members keep native display; the render wrapper below hides them
-	// entirely while their thinking is collapsed.
-	const toolUpdateDisplay = toolProto.updateDisplay;
-	toolProto.updateDisplay = function (this: ToolRuntime): void {
-		toolUpdateDisplay.call(this);
-		if (!state.compactThinking) return;
-		const group = this.toolCallId ? state.groups.get(this.toolCallId) : undefined;
-		if (group) return;
-		if (!this.expanded) collapseCompactResult(this);
-	};
-
+	// Compact mode: tools in a thinking group hide until the thinking is
+	// expanded. Tools without a group render a one-line summary (same style as
+	// the thinking preview); clicking it expands the full tool.
 	const toolRender = toolProto.render;
 	toolProto.render = function (this: ToolRuntime, width: number): string[] {
 		const group = this.toolCallId ? state.groups.get(this.toolCallId) : undefined;
-		const inGroup = Boolean(group);
-		const groupHidden = Boolean(group && isThinkingHidden(group.assistant, group.runIndex));
-		if (this.compactState !== state.compactThinking || this.inGroup !== inGroup || this.groupHidden !== groupHidden) {
-			const enteringCompact = state.compactThinking && this.compactState !== true;
+		if (this.compactState !== state.compactThinking) {
+			if (state.compactThinking && !group) this.expanded = false;
 			this.compactState = state.compactThinking;
-			this.inGroup = inGroup;
-			this.groupHidden = groupHidden;
-			// ctrl+t folds no-thinking tools even if ctrl+o had expanded them.
-			if (enteringCompact && !inGroup) this.expanded = false;
-			toolProto.updateDisplay.call(this);
 		}
-		if (state.compactThinking && groupHidden) return [];
+		if (state.compactThinking) {
+			if (group) {
+				if (isThinkingHidden(group.assistant, group.runIndex)) return [];
+				state.lastVisibleWasBar = false;
+			} else if (!this.expanded) {
+				const summary = buildToolSummary(this, width, state);
+				const lines = state.lastVisibleWasBar ? [summary] : ["", summary];
+				state.lastVisibleWasBar = true;
+				return lines;
+			} else {
+				state.lastVisibleWasBar = false;
+			}
+		} else {
+			state.lastVisibleWasBar = false;
+		}
 		return toolRender.call(this, width);
+	};
+
+	const toolHandleMouse = toolProto.handleMouse;
+	toolProto.handleMouse = function (this: ToolRuntime, event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (state.compactThinking && event.type === "click" && event.button === "left") {
+			const group = this.toolCallId ? state.groups.get(this.toolCallId) : undefined;
+			if (group) {
+				// Clicking a tool of an expanded thinking group collapses the group.
+				if (!isThinkingHidden(group.assistant, group.runIndex)) {
+					group.assistant.thinkingVisibilityOverrides?.set(group.runIndex, true);
+					if (group.assistant.lastMessage) group.assistant.updateContent?.(group.assistant.lastMessage);
+					(state.tui as { requestRender?: () => void } | undefined)?.requestRender?.();
+					return { handled: true };
+				}
+			} else {
+				// No thinking group: toggle between the one-line summary and the
+				// full tool (result expansion stays on ctrl+o).
+				const next = this.expanded !== true;
+				this.expanded = next;
+				this.setExpanded?.(next);
+				(state.tui as { requestRender?: () => void } | undefined)?.requestRender?.();
+				return { handled: true };
+			}
+		}
+		return toolHandleMouse?.call(this, event);
 	};
 
 	state.originals = {
@@ -579,7 +635,7 @@ function installPatches(state: PatchState): void {
 		compositeIndicator,
 		updateThinkingVisibility,
 		toolRender,
-		toolUpdateDisplay,
+		toolHandleMouse,
 	};
 	state.patched = true;
 }
@@ -595,11 +651,13 @@ function removePatches(state: PatchState): void {
 	altScreenProto.compositeScrollToEndIndicator = originals.compositeIndicator;
 	interactiveProto.updateThinkingBlockVisibility = originals.updateThinkingVisibility;
 	toolProto.render = originals.toolRender;
-	toolProto.updateDisplay = originals.toolUpdateDisplay;
+	if (originals.toolHandleMouse) toolProto.handleMouse = originals.toolHandleMouse;
+	else delete toolProto.handleMouse;
 	state.originals = undefined;
 	state.patched = false;
 	state.compactThinking = false;
 	state.groups.clear();
+	state.lastVisibleWasBar = false;
 	clearAnchorFlash(state);
 	state.anchorIndex = undefined;
 	state.anchorScrollTop = undefined;
@@ -733,6 +791,7 @@ export default function messageNavigatorExtension(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		state.groups.clear();
 		state.compactThinking = false;
+		state.lastVisibleWasBar = false;
 		clearAnchorFlash(state);
 		state.anchorIndex = undefined;
 		state.anchorScrollTop = undefined;
