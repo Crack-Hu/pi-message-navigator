@@ -33,7 +33,8 @@ Pi 原生只有两个开关：
 
 - `ctrl+t` 隐藏 thinking 时，整块折叠成一行：`▌ 这段思考的前 N 列…`（超出宽度自动加省略号）；
 - **点击这一行** → 展开完整 thinking + 工具调用/结果；再点收起；
-- 展开时会取消"跟随输出"并保持当前滚动位置，思考从原来的位置向下展开，不会跳到末尾；
+- 展开/收起会在下一帧布局后修正滚动位置：组标题可见时保持原位；标题已滚出视口时，把它带到你点击的工具行，不会因为内容变矮而被钳到末尾；
+- 展开时取消"跟随输出"，思考从原来的位置向下展开，不会跳到末尾；
 - 折叠时该组的工具组件完全不渲染；
 - `ctrl+o` 仍然只控制展开后工具结果的预览/完整输出；
 - 没有 thinking 的 AI 工具调用不参与分组，在紧凑模式下显示一行 **`▌ …` 摘要**（超宽截断），点击在摘要和完整工具之间切换（结果展开仍用 `ctrl+o`）；
@@ -57,7 +58,8 @@ Pi 1.6 的 `Container.render()` 会跨帧复用同一个 lines 数组，`Contain
 运行时包装的内部方法（`session_shutdown` 全部还原）：
 
 - `UserMessageComponent.render` / `AssistantMessageComponent.render`：跳转后给锚点行加红底闪烁；`AssistantMessageComponent.render` 同时负责紧凑模式下的预览行；
-- `AssistantMessageComponent.handleMouse`：点击 thinking 后固定滚动位置，避免自动跳到新的末尾；
+- `AssistantMessageComponent.handleMouse`：点击 thinking 后记录锚点，展开/收起时保持可见组头（或在组头不可见时带到点击行）；
+- `ScrollView.updateLayout`：等新内容高度测量完成后修正 `scrollTop`，避免折叠时被钳到新的底部；
 - `ToolExecutionComponent.render` / `handleMouse`：有 thinking 组时隐藏/按展开显示，点击组内工具收起整组；没有组时渲染一行摘要，点击切换摘要/完整工具；
 - `TuiAltScreen.scrollToPrompt`：改为锚点跳转，找不到时回退原生行为；
 - `TuiAltScreen.compositeScrollToEndIndicator`：隐藏内置的 "↓ Jump to latest message" 胶囊，由按钮行的 `Latest` 取代；

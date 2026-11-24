@@ -18,7 +18,9 @@
  * is hidden the group collapses to a single preview line taken from the
  * thinking text (truncated with an ellipsis), and the group's tool components
  * disappear. Clicking the preview expands the full thinking and the tools;
- * tool results keep ctrl+o's native preview / expand behavior.
+ * collapsing keeps a visible group header in place (or brings it to the
+ * clicked tool row), so the viewport does not snap to the new bottom.
+ * Tool results keep ctrl+o's native preview / expand behavior.
  */
 
 import {
@@ -30,6 +32,7 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
+	ScrollView,
 	TuiAltScreen,
 	getKeybindings,
 	stripTerminalSequences,
@@ -63,6 +66,15 @@ const altScreenProto = TuiAltScreen.prototype as unknown as {
 	scrollToPrompt: ScrollToPromptFn;
 	compositeScrollToEndIndicator: CompositeIndicatorFn;
 };
+
+/** `updateLayout` is public on ScrollView but not part of the narrow transcript view. */
+type UpdateScrollLayoutFn = (
+	this: ScrollView,
+	contentHeight: number,
+	viewportHeight: number,
+	requestRender: () => void,
+) => void;
+const scrollViewProto = ScrollView.prototype as unknown as { updateLayout: UpdateScrollLayoutFn };
 
 /** `updateThinkingBlockVisibility` is TS-private on InteractiveMode. */
 type UpdateThinkingVisibilityFn = (this: { hideThinkingBlock?: boolean }) => void;
@@ -104,6 +116,23 @@ interface ThinkingGroup {
 	runIndex: number;
 }
 
+/**
+ * A row to keep pinned after the next layout. Content height changes when a
+ * thinking group or tool block expands/collapses, so the scroll must be
+ * corrected after ScrollView.updateLayout has measured the new height.
+ */
+interface PendingScroll {
+	scrollView: TranscriptView["scrollView"];
+	document?: TranscriptView["document"];
+	component: unknown;
+	/** Fixed line inside the component (thinking preview/block start). */
+	offset?: number;
+	/** Dynamic line lookup for a tool that swaps between summary and full render. */
+	findOffset?: (lines: readonly string[]) => number | undefined;
+	/** Row inside the viewport that should hold the anchor after the toggle. */
+	screenRow: number;
+}
+
 /** A jump target: transcript row, owning component and its line inside it. */
 interface Anchor {
 	row: number;
@@ -129,6 +158,8 @@ interface PatchState {
 	anchorIndex?: number;
 	/** scrollTop right after that jump; a manual scroll invalidates the index. */
 	anchorScrollTop?: number;
+	/** Anchor to apply after the next content layout (collapse/expand). */
+	pendingScroll?: PendingScroll;
 	focusTimer?: ReturnType<typeof setTimeout>;
 	originals?: {
 		userRender: typeof UserMessageComponent.prototype.render;
@@ -136,6 +167,7 @@ interface PatchState {
 		assistantHandleMouse?: AssistantHandleMouseFn;
 		scrollToPrompt: ScrollToPromptFn;
 		compositeIndicator: CompositeIndicatorFn;
+		updateScrollLayout: UpdateScrollLayoutFn;
 		updateThinkingVisibility: UpdateThinkingVisibilityFn;
 		toolRender: ToolRenderFn;
 		toolHandleMouse?: ToolHandleMouseFn;
@@ -271,6 +303,75 @@ function firstTextLineOffset(component: AssistantRuntime, width: number): number
 	for (const child of children) {
 		if (child === firstText) return offset;
 		offset += child.render(width).length;
+	}
+	return undefined;
+}
+
+/** Row/rendered lines of one component inside a Container.childLines tree. */
+interface ComponentLayout {
+	row: number;
+	lines: readonly string[];
+}
+
+function findComponentLayout(container: unknown, target: unknown, base = 0): ComponentLayout | undefined {
+	const layout = (container as { childLines?: ChildLines } | undefined)?.childLines;
+	if (!layout?.children || !Array.isArray(layout.parts)) return undefined;
+	let row = base;
+	for (let i = 0; i < layout.children.length; i++) {
+		const child = layout.children[i];
+		const lines = layout.parts[i] ?? [];
+		if (child === target) return { row, lines };
+		if ((child as { childLines?: ChildLines } | undefined)?.childLines) {
+			const found = findComponentLayout(child, target, row);
+			if (found) return found;
+		}
+		row += lines.length;
+	}
+	return undefined;
+}
+
+function isVisibleRow(row: number | undefined, height: number): row is number {
+	return row !== undefined && row >= 0 && (height === 0 || row < height);
+}
+
+/** Viewport row occupied by a click, clamped to the visible viewport. */
+function clickedScreenRow(transcript: TranscriptView, component: unknown, localY: number): number | undefined {
+	const found = transcript.document ? findComponentLayout(transcript.document, component) : undefined;
+	if (!found) return undefined;
+	const height = typeof transcript.scrollView.viewportHeight === "number" ? transcript.scrollView.viewportHeight : 0;
+	const row = found.row + localY - transcript.scrollView.scrollTop;
+	return height > 0 ? Math.max(0, Math.min(height - 1, row)) : Math.max(0, row);
+}
+
+/**
+ * Offset of the first thinking run's rendered line. Expanded thinking is
+ * wrapped in a MouseRegion; the markdown child is one level down.
+ */
+function firstThinkingLineOffset(component: AssistantRuntime, width: number): number | undefined {
+	const thinking = component.markdownSlots?.find((slot) => slot.kind === "thinking")?.markdown;
+	const children = component.contentContainer?.children;
+	if (!thinking || !children) return undefined;
+	let offset = 0;
+	for (const child of children) {
+		const inner = (child as { child?: MarkdownChild }).child;
+		if (child === thinking || inner === thinking) return offset;
+		offset += child.render(width).length;
+	}
+	return undefined;
+}
+
+/** First line containing the compact marker, used after a tool collapse. */
+function firstBarOffset(lines: readonly string[]): number | undefined {
+	for (let i = 0; i < lines.length; i++) {
+		if (stripTerminalSequences(lines[i] ?? "").includes("▌")) return i;
+	}
+	return undefined;
+}
+
+/** First non-empty line, i.e. the call row of a fully rendered tool. */
+function firstNonEmptyOffset(lines: readonly string[]): number | undefined {
+	for (let i = 0; i < lines.length; i++) {
+		if (stripTerminalSequences(lines[i] ?? "").trim()) return i;
 	}
 	return undefined;
 }
@@ -535,18 +636,62 @@ function installPatches(state: PatchState): void {
 		return lines;
 	};
 
-	// Expanding a thinking group grows the transcript. If the viewport was
-	// following the end, the ScrollView would snap to the new bottom and show
-	// the end of the thinking. Pinning scrollTop with follow disabled keeps the
-	// preview row in place so the expanded text starts where it was clicked.
+	// Expanding or collapsing changes the transcript height. Correct the
+	// scroll after the next layout: keep a visible thinking header in place,
+	// otherwise bring the header to the row the user clicked. Pinning the old
+	// scrollTop directly would clamp to the new bottom for a tall group near
+	// the end, which is the "page jumped somewhere" effect.
 	const assistantHandleMouse = assistantProto.handleMouse;
 	assistantProto.handleMouse = function (this: AssistantMessageComponent, event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const runtime = this as unknown as AssistantRuntime;
+		const transcript = state.tui ? findTranscript(state.tui) : undefined;
+		const wasHidden = runtime.lastMessage ? isThinkingHidden(runtime, 0) : false;
+		const found = transcript?.document ? findComponentLayout(transcript.document, this) : undefined;
+		const clickedRow = transcript ? clickedScreenRow(transcript, this, event.y) : undefined;
+		// Expanding: the label row becomes the first thinking row. Collapsing:
+		// the thinking block start becomes the preview row.
+		const blockOffset = wasHidden ? event.y : firstThinkingLineOffset(runtime, event.width);
+		let screenRow = clickedRow;
+		if (!wasHidden && transcript && found && blockOffset !== undefined) {
+			// Keep a visible thinking header in place; only jump to the clicked
+			// row when the user collapsed from a scrolled-down position.
+			const height = typeof transcript.scrollView.viewportHeight === "number" ? transcript.scrollView.viewportHeight : 0;
+			const blockScreen = found.row + blockOffset - transcript.scrollView.scrollTop;
+			if (isVisibleRow(blockScreen, height)) screenRow = blockScreen;
+		}
 		const result = assistantHandleMouse?.call(this, event);
-		if (result?.handled && state.compactThinking && state.tui) {
-			const transcript = findTranscript(state.tui);
-			if (transcript) transcript.scrollView.scrollTo(transcript.scrollView.scrollTop, { disableFollow: true });
+		if (result?.handled && transcript && screenRow !== undefined) {
+			state.pendingScroll = {
+				scrollView: transcript.scrollView,
+				document: transcript.document,
+				component: this,
+				offset: blockOffset ?? event.y,
+				screenRow,
+			};
+			(state.tui as { requestRender?: () => void } | undefined)?.requestRender?.();
 		}
 		return result;
+	};
+
+	// ScrollView clamps scrollTop against the *new* content height. Apply the
+	// pending anchor here, after the height is known and before the frame is
+	// painted, so collapsing a tall group cannot snap the viewport to the end.
+	const updateScrollLayout = scrollViewProto.updateLayout;
+	scrollViewProto.updateLayout = function (
+		this: ScrollView,
+		contentHeight: number,
+		viewportHeight: number,
+		requestRender: () => void,
+	): void {
+		updateScrollLayout.call(this, contentHeight, viewportHeight, requestRender);
+		const pending = state.pendingScroll;
+		if (!pending || pending.scrollView !== this) return;
+		state.pendingScroll = undefined;
+		if (!pending.document) return;
+		const found = findComponentLayout(pending.document, pending.component);
+		if (!found) return;
+		const offset = pending.findOffset?.(found.lines) ?? pending.offset ?? 0;
+		this.scrollTo(found.row + offset - pending.screenRow, { disableFollow: true });
 	};
 
 	// Retarget Pi's prompt jumping at message anchors instead of OSC markers.
@@ -605,21 +750,61 @@ function installPatches(state: PatchState): void {
 	const toolHandleMouse = toolProto.handleMouse;
 	toolProto.handleMouse = function (this: ToolRuntime, event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (state.compactThinking && event.type === "click" && event.button === "left") {
+			const transcript = state.tui ? findTranscript(state.tui) : undefined;
+			const clickedRow = transcript ? clickedScreenRow(transcript, this, event.y) : undefined;
+			const found = transcript?.document ? findComponentLayout(transcript.document, this) : undefined;
 			const group = this.toolCallId ? state.groups.get(this.toolCallId) : undefined;
 			if (group) {
 				// Clicking a tool of an expanded thinking group collapses the group.
 				if (!isThinkingHidden(group.assistant, group.runIndex)) {
+					const offset = firstThinkingLineOffset(group.assistant, event.width);
+					// If the group header is visible, keep it where it is; otherwise
+					// bring it to the tool row the user just clicked.
+					let screenRow = clickedRow;
+					if (transcript?.document && offset !== undefined) {
+						const preview = findComponentLayout(transcript.document, group.assistant);
+						const previewScreen = preview ? preview.row + offset - transcript.scrollView.scrollTop : undefined;
+						const height = typeof transcript.scrollView.viewportHeight === "number" ? transcript.scrollView.viewportHeight : 0;
+						if (isVisibleRow(previewScreen, height)) screenRow = previewScreen;
+					}
 					group.assistant.thinkingVisibilityOverrides?.set(group.runIndex, true);
 					if (group.assistant.lastMessage) group.assistant.updateContent?.(group.assistant.lastMessage);
+					if (transcript && screenRow !== undefined) {
+						state.pendingScroll = {
+							scrollView: transcript.scrollView,
+							document: transcript.document,
+							component: group.assistant,
+							offset: offset ?? 0,
+							screenRow,
+						};
+					}
 					(state.tui as { requestRender?: () => void } | undefined)?.requestRender?.();
 					return { handled: true };
 				}
 			} else {
 				// No thinking group: toggle between the one-line summary and the
-				// full tool (result expansion stays on ctrl+o).
+				// full tool (result expansion stays on ctrl+o). Expanding keeps
+				// the clicked summary row; collapsing keeps the call row if it is
+				// visible, otherwise the row the user clicked.
 				const next = this.expanded !== true;
+				let screenRow = clickedRow;
+				if (!next && transcript && found) {
+					const callOffset = firstNonEmptyOffset(found.lines);
+					const callScreen = callOffset !== undefined ? found.row + callOffset - transcript.scrollView.scrollTop : undefined;
+					const height = typeof transcript.scrollView.viewportHeight === "number" ? transcript.scrollView.viewportHeight : 0;
+					if (isVisibleRow(callScreen, height)) screenRow = callScreen;
+				}
 				this.expanded = next;
 				this.setExpanded?.(next);
+				if (transcript && screenRow !== undefined) {
+					state.pendingScroll = {
+						scrollView: transcript.scrollView,
+						document: transcript.document,
+						component: this,
+						findOffset: next ? firstNonEmptyOffset : firstBarOffset,
+						screenRow,
+					};
+				}
 				(state.tui as { requestRender?: () => void } | undefined)?.requestRender?.();
 				return { handled: true };
 			}
@@ -633,6 +818,7 @@ function installPatches(state: PatchState): void {
 		assistantHandleMouse,
 		scrollToPrompt,
 		compositeIndicator,
+		updateScrollLayout,
 		updateThinkingVisibility,
 		toolRender,
 		toolHandleMouse,
@@ -649,6 +835,7 @@ function removePatches(state: PatchState): void {
 	else delete assistantProto.handleMouse;
 	altScreenProto.scrollToPrompt = originals.scrollToPrompt;
 	altScreenProto.compositeScrollToEndIndicator = originals.compositeIndicator;
+	scrollViewProto.updateLayout = originals.updateScrollLayout;
 	interactiveProto.updateThinkingBlockVisibility = originals.updateThinkingVisibility;
 	toolProto.render = originals.toolRender;
 	if (originals.toolHandleMouse) toolProto.handleMouse = originals.toolHandleMouse;
@@ -658,6 +845,7 @@ function removePatches(state: PatchState): void {
 	state.compactThinking = false;
 	state.groups.clear();
 	state.lastVisibleWasBar = false;
+	state.pendingScroll = undefined;
 	clearAnchorFlash(state);
 	state.anchorIndex = undefined;
 	state.anchorScrollTop = undefined;
