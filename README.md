@@ -44,6 +44,12 @@ Pi 原生只有两个开关：
 
 预览行就是 Pi 原生 thinking 标签的位置，所以点击复用原生逻辑；分组状态只存在于渲染层，不写会话文件、不进模型上下文。
 
+## 用户消息底色
+
+插件只改 `userMessageBg` 这一项：取主题原 `userMessageBg` 做 **OKLCH 色相偏移 +135°**，明度和彩度保持不变。
+
+这样 dark 主题会得到同明度的暗暖色，light 主题得到同明度的浅暖色，和当前主题（包括 system / 自定义主题）保持同一套色彩系统，而不是写死一个橙色。实现上是运行时重写 `Theme.bg("userMessageBg")`，`session_shutdown` 时还原。
+
 ## 实现方式
 
 Pi 1.6 的 `Container.render()` 会跨帧复用同一个 lines 数组，`Container.childLines` 记录了每个直接子组件的渲染结果（`children` + `parts`）。扩展据此：
@@ -63,7 +69,8 @@ Pi 1.6 的 `Container.render()` 会跨帧复用同一个 lines 数组，`Contain
 - `ToolExecutionComponent.render` / `handleMouse`：有 thinking 组时隐藏/按展开显示，点击组内工具收起整组；没有组时渲染一行摘要，点击切换摘要/完整工具；
 - `TuiAltScreen.scrollToPrompt`：改为锚点跳转，找不到时回退原生行为；
 - `TuiAltScreen.compositeScrollToEndIndicator`：隐藏内置的 "↓ Jump to latest message" 胶囊，由按钮行的 `Latest` 取代；
-- `InteractiveMode.updateThinkingBlockVisibility`：同步紧凑状态。
+- `InteractiveMode.updateThinkingBlockVisibility`：同步紧凑状态；
+- `Theme.bg`：把 `userMessageBg` 换成上面定义的暖色。
 
 ## 安装
 

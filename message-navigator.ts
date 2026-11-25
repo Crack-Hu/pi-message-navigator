@@ -27,14 +27,16 @@ import {
 	AssistantMessageComponent,
 	InteractiveMode,
 	ToolExecutionComponent,
+	Theme,
 	UserMessageComponent,
 	type ExtensionAPI,
-	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
 	ScrollView,
 	TuiAltScreen,
 	getKeybindings,
+	colorToOklch,
+	oklchColor,
 	stripTerminalSequences,
 	truncateToWidth,
 	visibleWidth,
@@ -54,6 +56,7 @@ const MIN_CONTEXT_ROWS = 6;
 const SMALL_CONTEXT_DIVISOR = 8;
 /** Small viewports never hug the top edge (looks cramped). */
 const MIN_SMALL_CONTEXT_ROWS = 2;
+
 
 // ---------------------------------------------------------------------------
 // Shared state (survives /reload: the prototypes stay patched in-process)
@@ -81,6 +84,10 @@ type UpdateThinkingVisibilityFn = (this: { hideThinkingBlock?: boolean }) => voi
 const interactiveProto = InteractiveMode.prototype as unknown as {
 	updateThinkingBlockVisibility: UpdateThinkingVisibilityFn;
 };
+
+/** `Theme.bg`: route `userMessageBg` through a warm concrete color. */
+type ThemeBgFn = (this: Theme, color: string, text: string) => string;
+const themeProto = Theme.prototype as unknown as { bg: ThemeBgFn };
 
 type AssistantHandleMouseFn = (
 	this: AssistantMessageComponent,
@@ -169,6 +176,7 @@ interface PatchState {
 		compositeIndicator: CompositeIndicatorFn;
 		updateScrollLayout: UpdateScrollLayoutFn;
 		updateThinkingVisibility: UpdateThinkingVisibilityFn;
+		themeBg: ThemeBgFn;
 		toolRender: ToolRenderFn;
 		toolHandleMouse?: ToolHandleMouseFn;
 	};
@@ -694,6 +702,24 @@ function installPatches(state: PatchState): void {
 		this.scrollTo(found.row + offset - pending.screenRow, { disableFollow: true });
 	};
 
+	// User messages use the complement of the theme's own userMessageBg:
+	// rotate the OKLCH hue by 180° and keep lightness/chroma, so the result
+	// follows the active theme instead of being a fixed color.
+	const themeBg = themeProto.bg;
+	themeProto.bg = function (this: Theme, color: string, text: string): string {
+		if (color === "userMessageBg") {
+			try {
+				const base = this.colors.userMessageBg;
+				const channels = colorToOklch(base);
+				const complement = oklchColor(channels.l, channels.c, channels.h + 135);
+				return this.style(text, { bg: complement });
+			} catch {
+				// Fall through to the theme's own color.
+			}
+		}
+		return themeBg.call(this, color, text);
+	};
+
 	// Retarget Pi's prompt jumping at message anchors instead of OSC markers.
 	const scrollToPrompt = altScreenProto.scrollToPrompt;
 	altScreenProto.scrollToPrompt = function (this: TuiAltScreen, direction: number): void {
@@ -820,6 +846,7 @@ function installPatches(state: PatchState): void {
 		compositeIndicator,
 		updateScrollLayout,
 		updateThinkingVisibility,
+		themeBg,
 		toolRender,
 		toolHandleMouse,
 	};
@@ -837,6 +864,7 @@ function removePatches(state: PatchState): void {
 	altScreenProto.compositeScrollToEndIndicator = originals.compositeIndicator;
 	scrollViewProto.updateLayout = originals.updateScrollLayout;
 	interactiveProto.updateThinkingBlockVisibility = originals.updateThinkingVisibility;
+	themeProto.bg = originals.themeBg;
 	toolProto.render = originals.toolRender;
 	if (originals.toolHandleMouse) toolProto.handleMouse = originals.toolHandleMouse;
 	else delete toolProto.handleMouse;
